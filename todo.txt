@@ -1,0 +1,16 @@
+NEXT:
+year modifier for plots?
+adventure
+	make a copy of sqlite db from droplet and use that for testing
+	make another copy once you are going to go live to get new updates
+
+Other features:
+movie recommendations (scrape info about movies & save it and then have ai analyse this when making recs)
+rate limits (even if it's so high nobody would see it without automation) and ai limits
+ai stat analyser with a db acc that can only query and cant insert/delete. multi step ai thing that can call up to x queries and then organize the output and make analysis
+email db error?
+add argument aliases (i.e. !s !ts)
+
+final transfer:
+copy sqlite curl -F "file=@melonbot.db" https://file.io
+create a partition on the hard drive with a space limit to place the db shit for this
