@@ -316,7 +316,7 @@ class Core(commands.Cog):
         except asyncpg.exceptions.PostgresError as e:
             print(f"Database error: {e}")
             return await ctx.send("Ruh roh database error")
-        return await send_goodly(ctx, f"date watched of {existing_movie['title']} has been changed to {date_watched}.")
+        return await send_goodly(ctx, f"date watched of {existing_movie['title']} has been changed to {date_watched.strftime('%Y-%m-%d')}.")
 
 class BrowseSuggestions(commands.Cog):
     @commands.command()
@@ -1113,7 +1113,10 @@ class Plotting(commands.Cog):
             print(f"Parsing User Input error: {e}")
             return await ctx.send("Ruh roh user input error")
         if not discord_id:
-            return await ctx.send(f"No user found for: {" ".join(user_input)}")
+            discord_id = ctx.message.author.id
+            username = await user_id_to_username(ctx, discord_id)
+            if not username:
+                username = str(discord_id)
         try:
             async with db_pool.acquire() as connection:
                 ratings = await fetch_as_dict(connection, 

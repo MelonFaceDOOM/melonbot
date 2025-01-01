@@ -92,26 +92,16 @@ def plot_movienights(data):
     averages = [row[1] for row in data]
     attendance = [row[2] for row in data]
 
-    # 2) Convert 'attendance' to area if you want circumference proportional to attendance
-    #    Adjust scale_factor to control how large or small you want the bubbles
     def attendance_to_area(circumference, scale_factor=20.0):
-        # area = circumference^2 / (4*pi)
         return (circumference ** 2) / (4.0 * math.pi) * scale_factor
 
     sizes = [attendance_to_area(a, scale_factor=20.0) for a in attendance]
 
-    # 3) Create the scatter plot
     fig, ax = plt.subplots(figsize=(8, 5))
     scatter_plot = ax.scatter(dates, averages, s=sizes, alpha=0.6, color='blue', edgecolor='black')
 
-    # 4) Format X-axis to show dates nicely
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
     ax.tick_params(axis='x', rotation=45)
-
-    # 5) Add labels/title
-    ax.set_xlabel('Date Watched')
-    ax.set_ylabel('Average Rating')
-    ax.set_title('Movies Scatterplot by Date, Average Rating, and Attendance')
 
     plt.tight_layout()
     buf = io.BytesIO()
