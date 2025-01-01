@@ -676,7 +676,7 @@ class BrowseMovienights(commands.Cog):
                 date_watched = "????-??-??"
             else:
                 date_watched = date_watched.strftime("%Y-%m-%d")
-            message += f"{date_watched} - {rating["title"]}: {rating['rating']:.1f}\n"
+            message += f"{date_watched} - {rating['title']}: {rating['rating']:.1f}\n"
         return await send_goodly(ctx, message)
    
     @commands.command()
@@ -722,7 +722,7 @@ class BrowseMovienights(commands.Cog):
                 date_watched = "????-??-??"
             else:
                 date_watched = date_watched.strftime("%Y-%m-%d")
-            message += f"{date_watched} - {rating["title"]}: {rating['rating']:.1f}\n"
+            message += f"{date_watched} - {rating['title']}: {rating['rating']:.1f}\n"
         return await send_goodly(ctx, message)
  
     @commands.command()
@@ -760,7 +760,7 @@ class BrowseMovienights(commands.Cog):
                 date_watched = "????-??-??"
             else:
                 date_watched = date_watched.strftime("%Y-%m-%d")
-            message += f"{date_watched} - {movie["title"]}\n"
+            message += f"{date_watched} - {movie['title']}\n"
         return await send_goodly(ctx, message)
             
     @commands.command()
@@ -873,7 +873,7 @@ class BrowseMovienights(commands.Cog):
             reviewer_rating = [i for i in ratings if i['user_id']==review['user_id']]
             if reviewer_rating:
                 reviewer_rating = reviewer_rating[0]['rating']
-            message += f'{review['movie']['title'].upper()} - {reviewer_rating}/10\n- by {review['reviewer_name']}\n{review['review_text']}\n{'-'*60}\n'
+            message += f"{review['movie']['title'].upper()} - {reviewer_rating}/10\n- by {review['reviewer_name']}\n{review['review_text']}\n{'-'*60}\n"
         return await send_goodly(ctx, message)
         
     @commands.command()
@@ -1790,7 +1790,7 @@ intents = Intents.default()
 intents.members = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="[[[",
+bot = commands.Bot(command_prefix="!",
                    case_insensitive=True,
                    intents=intents,
                    description='ur fav movienight companion.')  
