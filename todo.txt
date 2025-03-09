@@ -1,4 +1,6 @@
 NEXT:
+!transfer 'grand prix' falco
+	melonbot: User 'prix' falco' not found
 year modifier for plots?
 adventure
 	make a copy of sqlite db from droplet and use that for testing
@@ -12,5 +14,6 @@ email db error?
 add argument aliases (i.e. !s !ts)
 
 final transfer:
-copy sqlite curl -F "file=@melonbot.db" https://file.io
+copy sqlite:
+	curl -F "file=@melonbot.db" https://file.io
 create a partition on the hard drive with a space limit to place the db shit for this

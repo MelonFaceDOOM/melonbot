@@ -9,7 +9,7 @@ from discord.ext import commands
 from discord.utils import get
 from discord import Intents
 from discord import File
-from matching import find_closest_match, find_closest_match_and_score, rank_matches
+from matching import find_closest_match_and_score, rank_matches
 from config import bot_token, PSQL_CREDENTIALS
 from scraping.ebert import ebert_lookup
 import plotting
@@ -102,7 +102,7 @@ class Core(commands.Cog):
         if cutoff > -1:
             rating = str(rating)[:cutoff]
         rating = float(rating)
-        rating = int(rating * 100) / 100 # -> float
+        rating = int(round(rating * 100)) / 100
         if rating < 1 or rating > 10:
             return await ctx.send("rating must be between 1 and 10")
         if existing_movie['date_watched']:
@@ -256,7 +256,6 @@ class Core(commands.Cog):
         movie_titles = [(row['title'].lower(), "movie") for row in movies]
         full_search_list = usernames + movie_titles
         ranked_matches = rank_matches(user_input, full_search_list)
-        
         # STEP 3) determine what to return based on pagination options
         if not pagination:
             matches = [ranked_matches[0]]
@@ -1422,7 +1421,7 @@ async def name_or_mention_to_id(ctx, name_or_mention):
             return None # send error through ctx here or let the func that calls this do it?
     else:
         names = [i[1] for i in guild_user_info]
-        matched_name = find_closest_match(term=name_or_mention, bank=names, threshold=50)
+        matched_name, _ = find_closest_match_and_score(search_term=name_or_mention, bank=names)
         if matched_name:
             for i in guild_user_info:
                 if i[1] == matched_name:
