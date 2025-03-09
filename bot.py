@@ -382,7 +382,6 @@ class BrowseSuggestions(commands.Cog):
         else:
             title_descriptor = "LEAST"
         if not discord_id:
-
             sql = """SELECT movies.id, movies.title, movies.user_id, movies.date_suggested, COUNT(endorsements.id) AS endorsement_count 
                      FROM movies
                      INNER JOIN endorsements ON endorsements.movie_id = movies.id
@@ -392,7 +391,7 @@ class BrowseSuggestions(commands.Cog):
             sql_args = [guild_id, 0]
             title_from = "server"
         else:
-            sql = """SELECT movies.id movies.title, movies.date_suggested, COUNT(endorsements.id) AS endorsement_count 
+            sql = """SELECT movies.id, movies.title, movies.date_suggested, COUNT(endorsements.id) AS endorsement_count 
                      FROM movies
                      INNER JOIN endorsements ON endorsements.movie_id = movies.id
                      WHERE endorsements.guild_id=$1
@@ -412,7 +411,7 @@ class BrowseSuggestions(commands.Cog):
         movies_chooser_endorsements = []
         suggestions.sort(key=lambda x: x['endorsement_count'], reverse=True)
         suggestions = await paginate(suggestions, pagination[0], pagination[1])
-        message = f"------ {title_descriptor} MOVIES FROM {title_from.upper()}------\n"
+        message = f"------ {title_descriptor}-ENDORSED MOVIES FROM {title_from.upper()}------\n"
         for suggestion in suggestions:
             if not suggestion['date_suggested']:
                 date = "????-??-??"
@@ -1234,7 +1233,7 @@ async def create_found_username_message(ctx, guild_id, user_id):
         message += f'{matched_username} does not currently have any movie suggestions.\n'
     else:
         message += f'{matched_username} currently has {len(suggestions)} movie suggestion{"s" if len(suggestions) > 1 else ""}.\n\n'
-    message += f'find more info with !chooser {matched_username}, !ratings {matched_username}, or !suggestions {matched_username}.'
+    message += f'find more info with !suggestions {matched_username}, !endorsements {matched_username}, !movienights {matched_username} or !ratings {matched_username}.'
     return message
     
 async def create_found_movie_message(ctx, guild_id, matched_movie_title):    

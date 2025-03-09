@@ -17,3 +17,7 @@ final transfer:
 copy sqlite:
 	curl -F "file=@melonbot.db" https://file.io
 create a partition on the hard drive with a space limit to place the db shit for this
+
+bugs:
+!find ghost -> wrong movie
+	need to subtract points for extra characters that aren't part of user's query
