@@ -1321,6 +1321,10 @@ async def parse_squarefucker(user_input):
     returns parsed [] arg & returns the rest of the args without []"""
     new_user_input = [] # will convert to tuple before returning
     pattern = r"\[(-?)(\d+),?(\d*)\]"
+    # pattern = r"\[(-?)(\d+) *(?:, *(\d*))?\]"  # this would match [1 , 2], but...
+    # the problem is that discord splits arguments on spaces, so i would have to...
+    # try joining the last few args and then seeing if that's a match and that's...
+    # just a bit more of a pain than i want to deal with right now
     is_negative = False
     results_per_page = None
     page_num = None

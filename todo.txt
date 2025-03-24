@@ -1,6 +1,4 @@
 NEXT:
-!transfer 'grand prix' falco
-	melonbot: User 'prix' falco' not found
 year modifier for plots?
 adventure
 	make a copy of sqlite db from droplet and use that for testing
