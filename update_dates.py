@@ -21,6 +21,7 @@ def main():
             """,
             (date, movie)
         )
+    conn.commit()
     cur.close()
     conn.close()
     
