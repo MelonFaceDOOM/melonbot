@@ -58,6 +58,22 @@ def make_db():
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
                 FOREIGN KEY (movie_id) REFERENCES movies (id) ON DELETE CASCADE,
                 UNIQUE (guild_id, user_id, movie_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS narrate_prefs (
+                guild_id        BIGINT NOT NULL,
+                user_id         BIGINT NOT NULL,
+                text_channel_id BIGINT NOT NULL,
+                voice           VARCHAR(128),
+                rate            NUMERIC(4,2),
+                enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (guild_id, user_id),
+                FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id)  REFERENCES users  (id) ON DELETE CASCADE)""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS narrate_prefs_guild_enabled_idx
+                ON narrate_prefs (guild_id, enabled)""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS narrate_prefs_text_channel_idx
+                ON narrate_prefs (text_channel_id)""")
     conn.commit()
     cur.close()
     conn.close()
@@ -205,8 +221,8 @@ def fix_missing_date(date):
             return datetime.date(2020,1,1)
 
 if __name__ == "__main__":
-    drop_all_tables()
+    # drop_all_tables()
     make_db()
-    transfer_from_sqlite()
-    fix_sequencers()
+    # transfer_from_sqlite()
+    # fix_sequencers()
 

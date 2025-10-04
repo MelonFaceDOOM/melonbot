@@ -13,6 +13,10 @@ from matching import find_closest_match_and_score, rank_matches
 from config import bot_token, PSQL_CREDENTIALS
 from scraping.ebert import ebert_lookup
 import plotting
+from bot_narrate import NarrationCog
+from make_melonbot_db import make_db
+
+make_db() # update db tables. creates & closes its own conn
 
 # helper func for asyncpg
 async def fetch_as_dict(connection, query, *args):
@@ -1162,6 +1166,84 @@ class Plotting(commands.Cog):
         image_buffer = plotting.plot_favorites(owner_avg_rating, user_avg_rating)
         return await ctx.send(file=File(fp=image_buffer, filename="ratings_plot.png"))        
         
+    @commands.command()
+    async def plot_user_similarity(self, ctx, min_common: int = 5):
+        """<min_common> — Plot user rating similarity matrix. min_common (default 5) is minimum movies in common."""
+        guild_id = await get_guild_id(ctx)
+        try:
+            async with db_pool.acquire() as connection:
+                ratings = await fetch_as_dict(connection, 
+                    """SELECT ratings.user_id, ratings.movie_id, ratings.rating
+                       FROM ratings
+                       WHERE ratings.guild_id=$1""", guild_id)
+                if not ratings:
+                    return await ctx.send("No ratings found in this server")
+                
+                # Get total number of users who have rated movies
+                unique_users = await fetch_as_dict(connection,
+                    """SELECT COUNT(DISTINCT user_id) as user_count
+                       FROM ratings
+                       WHERE guild_id=$1""", guild_id)
+                user_count = unique_users[0]['user_count']
+                
+                if user_count < 2:
+                    return await ctx.send("Need at least 2 users with ratings to generate similarity plot.")
+                
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error")
+
+        try:
+            image_buffer = plotting.plot_user_similarity(ratings, min_common)
+            return await ctx.send(file=File(fp=image_buffer, filename="user_similarity.png"))
+        except ValueError as e:
+            return await ctx.send(str(e))
+        except Exception as e:
+            print(f"Plotting error: {e}")
+            return await ctx.send("Failed to generate plot. This might be due to insufficient rating data.")
+
+    @commands.command()
+    async def plot_user_similarity_test(self, ctx):
+        """Test the similarity plot with synthetic data."""
+        try:
+            image_buffer = plotting.plot_user_similarity_test()
+            return await ctx.send(file=File(fp=image_buffer, filename="user_similarity_test.png"))
+        except Exception as e:
+            print(f"Test plotting error: {e}")
+            return await ctx.send(f"Test plot failed with error: {str(e)}")
+
+    @commands.command()
+    async def plot_movie_spread(self, ctx, *movie_title):
+        """<movie title> — Plot the distribution of ratings for a movie."""
+        guild_id = await get_guild_id(ctx)
+        movie_title = " ".join(movie_title)
+        
+        # Find the movie using existing helper
+        movie = await find_exact_movie(guild_id, movie_title)
+        if not movie:
+            return await ctx.send(f"The movie'{movie_title}' doesn't exist.")
+            
+        # Get all ratings for this movie
+        try:
+            async with db_pool.acquire() as connection:
+                ratings = await fetch_as_dict(connection,
+                    """SELECT ratings.rating, ratings.user_id
+                       FROM ratings
+                       WHERE ratings.guild_id=$1 AND ratings.movie_id=$2""",
+                    guild_id, movie['id'])
+                if not ratings:
+                    return await ctx.send(f"No ratings found for '{movie_title}'")
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error")
+
+        try:
+            image_buffer = plotting.plot_movie_spread(movie, ratings)
+            return await ctx.send(file=File(fp=image_buffer, filename="movie_spread.png"))
+        except Exception as e:
+            print(f"Plotting error: {e}")
+            return await ctx.send("Failed to generate plot.")
+
 async def send_goodly(ctx, message):
     """standard way of sending a MESSAGE to the stupid user"""
     try:
@@ -1671,7 +1753,8 @@ class MyHelpCommand(commands.HelpCommand):
             ("BrowseSuggestions", "Browse Suggestions"),
             ("BrowseMovienights", "Browse Movienights"),
             ("Scraping", "Scraping"),
-            ("Plotting", "Plotting")
+            ("Plotting", "Plotting"),
+            ("Narrate", "Voice & Narration")
         ]
         
         # These are the commands you want in each category, in the exact order:
@@ -1711,7 +1794,12 @@ class MyHelpCommand(commands.HelpCommand):
             "Plotting": [
                 "plot_ratings",
                 "plot_movienights",
-                "plot_favorites"
+                "plot_favorites",
+                "plot_user_similarity",
+                "plot_movie_spread"
+            ],
+            "Narrate": [
+                "narrate",  # subcommands: start / stop / status
             ]
         }
         
@@ -1743,7 +1831,18 @@ class MyHelpCommand(commands.HelpCommand):
         "ebert": '<movie title> — Return a Rogert Ebert review for a movie. Ex. !ebert shrek 3',
         "plot_ratings": '<name or mention> — Plot ratings from a user.',
         "plot_movienights": '<name or mention> — Plot movienights from the server or from a specific user.',
-        "plot_favorites": '<name or mention> — Plot average ratings given from one user to each movie owner in the server.'
+        "plot_favorites": '<name or mention> — Plot average ratings given from one user to each movie owner in the server.',
+        "plot_user_similarity": '<min_common> — Plot user rating similarity matrix. min_common (default 5) is minimum movies in common.',
+        "plot_movie_spread": '<movie title> — Plot the distribution of ratings for a movie.',
+        "narrate": (
+                "Voice follow + TTS narration.\n"
+                "Usage:\n"
+                "• ?narrate on #text-channel [voice] [rate]\n"
+                "• ?narrate off\n"
+                "• ?narrate status\n"
+                "• ?narrate cancel   (alias: ?narrate x)\n"
+                "• ?narrate voices [lang-code]\n"
+            )
     }
     
     async def send_bot_help(self, mapping):
@@ -1791,12 +1890,16 @@ db_pool = None
 intents = Intents.default()
 intents.members = True
 intents.message_content = True
+intents.voice_states = True
+
 
 bot = commands.Bot(command_prefix="!",
                    case_insensitive=True,
                    intents=intents,
                    description='ur fav movienight companion.')  
 bot.help_command = MyHelpCommand()
+
+
 @bot.event
 async def on_ready():
     global db_pool
@@ -1805,14 +1908,20 @@ async def on_ready():
         print("Database connection pool created successfully.")
     except Exception as e:
         print(f"Failed to connect to the database: {e}")
+
+    # expose the pool so bot_voice can use it
+    bot.db_pool = db_pool
+
     await bot.add_cog(Core(bot))
     await bot.add_cog(BrowseSuggestions(bot))
     await bot.add_cog(BrowseMovienights(bot))
     await bot.add_cog(Scraping(bot))
     await bot.add_cog(Plotting(bot))
+
+    # NEW: voice/narration cog
+    await bot.add_cog(NarrationCog(bot))
+
     print("cogs added")
     print("setup complete")
-
-bot.run(bot_token)
         
-    
+bot.run(bot_token)
