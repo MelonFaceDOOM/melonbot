@@ -430,6 +430,7 @@ class NarrationCog(commands.Cog, name="Narrate"):
       !narrate status
       !narrate cancel | !narrate x
       !narrate voices
+      !narrate shutoff
 
     Behavior:
       - Most-Recent-Wins: the latest eligible user action takes control; the bot moves to their VC.
@@ -517,8 +518,21 @@ class NarrationCog(commands.Cog, name="Narrate"):
                    WHERE guild_id=$1 AND user_id=$2""",
                 guild_id, user_id, enabled
             )
+            
 
     # ---------- Channel monitoring helpers ---------
+    async def _enabled_user_ids(self, guild_id: int) -> List[int]:
+        pool = getattr(self.bot, "db_pool", None)
+        if not pool:
+            return []
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT user_id FROM narrate_prefs
+                   WHERE guild_id=$1 AND enabled=TRUE""",
+                guild_id
+            )
+        return [r["user_id"] for r in rows]
+    
     async def _any_enabled_in_channel(self, guild: discord.Guild, channel: discord.VoiceChannel) -> bool:
         member_ids = [m.id for m in channel.members if not m.bot]
         if not member_ids:
@@ -577,7 +591,8 @@ class NarrationCog(commands.Cog, name="Narrate"):
             "  !narrate cancel   (alias: !narrate x)\n"
             "  !narrate channel #text-channel\n"
             "  !narrate voice <full-voice-name>\n"
-            "  !narrate voices",
+            "  !narrate voices\n"
+            "  !narrate shutoff",
             suppress_embeds=True,
         )
 
@@ -674,14 +689,27 @@ class NarrationCog(commands.Cog, name="Narrate"):
         vname = (pref.get('voice') if pref else None) or DEFAULT_VOICE
         rate = (pref.get('rate') if pref else None) or DEFAULT_RATE
 
+        # NEW: list everyone enabled in this guild
+        enabled_ids = await self._enabled_user_ids(ctx.guild.id)
+        if enabled_ids:
+            enabled_mentions = []
+            for uid in enabled_ids:
+                m = ctx.guild.get_member(uid)
+                enabled_mentions.append(m.mention if m else f"<@{uid}>")
+            enabled_line = "• Enabled users in this guild: " + ", ".join(enabled_mentions)
+        else:
+            enabled_line = "• Enabled users in this guild: nobody has narrate enabled"
+
         await ctx.send(
             f"**Narration status**\n"
             f"• You: Enabled={enabled} | Channel={ch_disp} | Voice={vname} | Rate={rate}\n"
             f"• Bot VC: {vc_disp}\n"
             f"• Active narrator (most-recent): {who}\n"
-            f"Commands: !narrate on/off, channel, status, cancel, voice, voices",
+            f"{enabled_line}\n"
+            f"Commands: !narrate on/off, channel, status, cancel, voice, voices, shutoff",
             suppress_embeds=True,
         )
+
         
     # Set (and optionally live-apply) the text channel
     @narrate_root.command(name="channel")
@@ -770,6 +798,37 @@ class NarrationCog(commands.Cog, name="Narrate"):
             self._pending_user_text[key] = (deadline, parts)
         else:
             self._pending_user_text[key] = (deadline, [message.content])
+            
+            
+    @narrate_root.command(name="shutoff")
+    @commands.has_permissions(manage_guild=True)  # optional: gate it; remove if you want anyone to run it
+    async def narrate_shutoff(self, ctx: commands.Context):
+        pool = getattr(self.bot, "db_pool", None)
+        if not pool:
+            return await ctx.send("DB not available.", suppress_embeds=True)
+
+        # Disable everyone for this guild
+        async with pool.acquire() as conn:
+            status = await conn.execute(
+                """UPDATE narrate_prefs
+                   SET enabled=FALSE, updated_at=CURRENT_TIMESTAMP
+                   WHERE guild_id=$1 AND enabled=TRUE""",
+                ctx.guild.id
+            )
+        # asyncpg returns strings like "UPDATE 5"
+        try:
+            updated = int(status.split()[-1])
+        except Exception:
+            updated = 0
+
+        # Attempt disconnect if we're in VC
+        session = self._get_session(ctx.guild.id)
+        vc = session.voice_client
+        if vc and vc.is_connected():
+            await self._disconnect_if_no_enabled_in_channel(ctx.guild, vc.channel, session)
+
+        await ctx.send(f"Shutoff complete. Disabled narrate for {updated} user(s).", suppress_embeds=True)
+
 
     # ---------- Coalescer & enqueuer ----------
     async def _coalesce_loop(self):

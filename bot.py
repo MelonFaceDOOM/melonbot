@@ -1837,6 +1837,9 @@ class MyHelpCommand(commands.HelpCommand):
             "Aliases: !narrate x\n"
             "Example: !narrate cancel"
         ),
+        "narrate shutoff": (
+            "Disable for everyone in server\n"
+        )
     }
     
     async def send_bot_help(self, mapping):
