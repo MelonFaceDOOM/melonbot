@@ -10,6 +10,8 @@ import aiohttp
 import discord
 from discord.ext import commands
 from config import google_narrate_key
+from bot_helpers import get_user_id, get_guild_id
+
 
 # ==========================
 # Tuning knobs & feature flags
@@ -54,7 +56,7 @@ def _message_is_narrate_command(bot: commands.Bot, content: str) -> bool:
     prefixes = bot.command_prefix
     if callable(prefixes):
         # If you ever switch to a callable prefix, resolve it to a list; for now assume string
-        prefixes = "?"
+        prefixes = "!"
     if isinstance(prefixes, str):
         prefixes = [prefixes]
     for p in prefixes:
@@ -233,7 +235,7 @@ class GuildVoiceSession:
             if self.voice_client and self.voice_client.is_connected():
                 await self.voice_client.move_to(channel)
             else:
-                self.voice_client = await channel.connect(reconnect=True, self_deaf=True)
+                self.voice_client = await channel.connect(reconnect=False, self_deaf=True)
             self._ensure_player()
             self._ensure_idle_timer()
 
@@ -254,15 +256,59 @@ class GuildVoiceSession:
                 vc = self.voice_client
                 if not vc or not vc.is_connected():
                     return
+
                 if time.time() - self.last_activity > PLAYBACK_IDLE_DISCONNECT_SECS:
+                    # --- FULL TEARDOWN on idle ---
                     try:
+                        # Stop any residual playback
+                        try:
+                            if vc.is_playing():
+                                vc.stop()
+                        except Exception:
+                            pass
+
+                        # Disconnect (we connect with reconnect=False elsewhere)
                         await vc.disconnect(force=True)
                     finally:
+                        # Disable narration for ALL users in this guild
+                        try:
+                            pool = getattr(self.bot, "db_pool", None)
+                            if pool:
+                                async with pool.acquire() as conn:
+                                    await conn.execute(
+                                        """UPDATE narrate_prefs
+                                           SET enabled=FALSE, updated_at=CURRENT_TIMESTAMP
+                                           WHERE guild_id=$1""",
+                                        self.guild_id
+                                    )
+                        except Exception as e:
+                            print(f"[narrate] failed to disable prefs on idle: {e}")
+
+                        # Clear local state & background tasks
                         self.voice_client = None
                         self.active_user_id = None
-                        return
+
+                        if self.player_task and not self.player_task.done():
+                            self.player_task.cancel()
+                        self.player_task = None
+
+                        # cancel *this* idle task by returning
+                        if self.idle_task and not self.idle_task.done():
+                            self.idle_task.cancel()
+                        self.idle_task = None
+
+                        # Drain any queued audio so nothing nudges the VC
+                        try:
+                            while True:
+                                self.queue.get_nowait()
+                                self.queue.task_done()
+                        except asyncio.QueueEmpty:
+                            pass
+
+                        return  # exit the idle loop after teardown
         except asyncio.CancelledError:
             return
+
 
     # ---------- earcon generation ----------
     async def _get_earcon_bytes(self) -> bytes:
@@ -376,14 +422,14 @@ class GuildVoiceSession:
 # ==========================
 # Cog
 # ==========================
-class NarrationCog(commands.Cog, name="Voice"):
+class NarrationCog(commands.Cog, name="Narrate"):
     """
     Commands:
-      ?narrate on #text-channel [voice] [rate]
-      ?narrate off
-      ?narrate status
-      ?narrate cancel | ?narrate x
-      ?narrate voices
+      !narrate on #text-channel [voice] [rate]
+      !narrate off
+      !narrate status
+      !narrate cancel | !narrate x
+      !narrate voices
 
     Behavior:
       - Most-Recent-Wins: the latest eligible user action takes control; the bot moves to their VC.
@@ -450,6 +496,16 @@ class NarrationCog(commands.Cog, name="Voice"):
                 guild_id, user_id, text_channel_id, voice, rate, enabled
             )
 
+    async def _upsert_pref_ctx(self, ctx, text_channel_id, voice, rate, enabled):
+        pool = getattr(self.bot, "db_pool", None)
+        if not pool:
+            raise RuntimeError("db_pool not available")
+        guild_id = await get_guild_id(ctx, pool)
+        user_id  = await get_user_id(ctx, pool)
+        if guild_id is None or user_id is None:
+            return  # helpers already messaged on DB error
+        await self._upsert_pref(guild_id, user_id, text_channel_id, voice, rate, enabled)
+
     async def _set_enabled(self, guild_id: int, user_id: int, enabled: bool) -> None:
         pool = getattr(self.bot, "db_pool", None)
         if not pool:
@@ -480,27 +536,48 @@ class NarrationCog(commands.Cog, name="Voice"):
             )
             return row is not None
 
-    async def _disconnect_if_no_enabled_in_channel(self, guild: discord.Guild, channel: discord.VoiceChannel, session: GuildVoiceSession):
+    async def _disconnect_if_no_enabled_in_channel(self, guild: discord.Guild, channel: discord.VoiceChannel, session: "GuildVoiceSession"):
         has_enabled = await self._any_enabled_in_channel(guild, channel)
-        if not has_enabled and session.voice_client and session.voice_client.is_connected():
+        vc = session.voice_client
+
+        if not has_enabled and vc and vc.is_connected():
             try:
-                await session.voice_client.disconnect(force=True)
+                try:
+                    if vc.is_playing():
+                        vc.stop()
+                except Exception:
+                    pass
+                await vc.disconnect(force=True)
             finally:
                 session.voice_client = None
                 session.active_user_id = None
+
+                if session.player_task and not session.player_task.done():
+                    session.player_task.cancel()
+                session.player_task = None
+
+                # don't cancel the idle task here; it will end naturally since vc is None
+                # Clear queue so nothing triggers playback
+                try:
+                    while True:
+                        session.queue.get_nowait()
+                        session.queue.task_done()
+                except asyncio.QueueEmpty:
+                    pass
+
 
     # ---------- Commands ----------
     @commands.group(name="narrate", invoke_without_command=True)
     async def narrate_root(self, ctx: commands.Context):
         await ctx.send(
             "Usage:\n"
-            "  ?narrate on [#text-channel] [voice]\n"
-            "  ?narrate off\n"
-            "  ?narrate status\n"
-            "  ?narrate cancel   (alias: ?narrate x)\n"
-            "  ?narrate channel #text-channel\n"
-            "  ?narrate voice <full-voice-name>\n"
-            "  ?narrate voices",
+            "  !narrate on [#text-channel] [voice]\n"
+            "  !narrate off\n"
+            "  !narrate status\n"
+            "  !narrate cancel   (alias: !narrate x)\n"
+            "  !narrate channel #text-channel\n"
+            "  !narrate voice <full-voice-name>\n"
+            "  !narrate voices",
             suppress_embeds=True,
         )
 
@@ -519,8 +596,8 @@ class NarrationCog(commands.Cog, name="Voice"):
         ch = channel or (ctx.guild.get_channel(pref["text_channel_id"]) if pref and pref.get("text_channel_id") else None)
         if ch is None:
             return await ctx.send(
-                "Choose a text channel first: `?narrate on #your-text-channel [voice]` "
-                "or set it with `?narrate_channel #your-text-channel`.",
+                "Choose a text channel first: `!narrate on #your-text-channel [voice]` "
+                "or set it with `!narrate channel #your-text-channel`.",
                 suppress_embeds=True,
             )
 
@@ -528,7 +605,7 @@ class NarrationCog(commands.Cog, name="Voice"):
         if not (perms.view_channel and perms.send_messages and perms.read_message_history):
             return await ctx.send(f"I need view/send/read-history access in {ch.mention}.", suppress_embeds=True)
 
-        await self._upsert_pref(ctx.guild.id, ctx.author.id, ch.id, v, r, True)
+        await self._upsert_pref_ctx(ctx, ch.id, v, r, True)
         await self.tts.start()
 
         # Auto-join current VC if user is in one (most-recent wins)
@@ -602,7 +679,7 @@ class NarrationCog(commands.Cog, name="Voice"):
             f"• You: Enabled={enabled} | Channel={ch_disp} | Voice={vname} | Rate={rate}\n"
             f"• Bot VC: {vc_disp}\n"
             f"• Active narrator (most-recent): {who}\n"
-            f"Commands: ?narrate on/off, status, cancel, voices",
+            f"Commands: !narrate on/off, channel, status, cancel, voice, voices",
             suppress_embeds=True,
         )
         
@@ -616,7 +693,7 @@ class NarrationCog(commands.Cog, name="Voice"):
         if not (perms.view_channel and perms.send_messages and perms.read_message_history):
             return await ctx.send(f"I need view/send/read-history access in {channel.mention}.", suppress_embeds=True)
 
-        await self._upsert_pref(ctx.guild.id, ctx.author.id, channel.id, v, r, pref.get("enabled") if pref else True)
+        await self._upsert_pref_ctx(ctx, channel.id, v, r, pref.get("enabled") if pref else True)
         await ctx.send(f"Default narration channel set to {channel.mention}.", suppress_embeds=True)
 
         # Live-apply: nothing to move in VC; we just start reading from the new text channel for this user.
@@ -628,13 +705,12 @@ class NarrationCog(commands.Cog, name="Voice"):
         pref = await self._get_pref(ctx.guild.id, ctx.author.id)
         if not pref:
             # Create a row with defaults for channel=required later
-            await self._upsert_pref(ctx.guild.id, ctx.author.id, ctx.channel.id, voice, DEFAULT_RATE, True)
+            await self._upsert_pref_ctx(ctx, ctx.channel.id, voice, DEFAULT_RATE, True)
             return await ctx.send(
-                f"Default voice set to `{voice}`. Use `?narrate on #text-channel` to start.",
+                f"Default voice set to `{voice}`. Use `!narrate on #text-channel` to start.",
                 suppress_embeds=True,
             )
-
-        await self._upsert_pref(ctx.guild.id, ctx.author.id, pref["text_channel_id"], voice, pref.get("rate") or DEFAULT_RATE, pref.get("enabled"))
+        await self._upsert_pref_ctx(ctx, pref["text_channel_id"], voice, pref.get("rate") or DEFAULT_RATE, pref.get("enabled"))
         await ctx.send(f"Default voice set to `{voice}`.", suppress_embeds=True)
         # Live-apply: the next narration will use this voice automatically.
 
@@ -661,14 +737,17 @@ class NarrationCog(commands.Cog, name="Voice"):
         if not message.guild or message.author.bot:
             return
 
-        # Ignore our own command messages (e.g., "?narrate on …")
+        # Ignore our own command messages (e.g., "!narrate on …")
         if _message_is_narrate_command(self.bot, message.content):
             return
 
         pref = await self._get_pref(message.guild.id, message.author.id)
         if not pref or not pref.get("enabled"):
             return
-        if message.channel.id != pref["text_channel_id"]:
+        target = pref["text_channel_id"]
+        chan = message.channel
+        parent_id = getattr(chan, "parent_id", None)
+        if not (chan.id == target or parent_id == target):
             return
 
         # Claim session (MOST-RECENT-WINS) and ensure connection

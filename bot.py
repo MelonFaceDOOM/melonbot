@@ -14,22 +14,18 @@ from config import bot_token, PSQL_CREDENTIALS
 from scraping.ebert import ebert_lookup
 import plotting
 from bot_narrate import NarrationCog
+from bot_helpers import fetch_as_dict, get_user_id, get_guild_id
 from make_melonbot_db import make_db
 
 make_db() # update db tables. creates & closes its own conn
-
-# helper func for asyncpg
-async def fetch_as_dict(connection, query, *args):
-    rows = await connection.fetch(query, *args)
-    return [dict(row) for row in rows]
 
 class Core(commands.Cog):
     @commands.command()
     async def add(self, ctx, *movie_title):
         """<movie title> — Add a movienight suggestion."""
         movie_title = " ".join(movie_title)
-        user_id = await get_user_id(ctx)
-        guild_id = await get_guild_id(ctx)
+        user_id = await get_user_id(ctx, db_pool)
+        guild_id = await get_guild_id(ctx, db_pool)
         existing_movie = await find_exact_movie(guild_id, movie_title)
         if existing_movie:
             if existing_movie['watched'] == 1:
@@ -50,7 +46,7 @@ class Core(commands.Cog):
     async def remove(self, ctx, *movie_title):
         """<movie title> — Remove a suggestion."""
         movie_title = " ".join(movie_title)
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         existing_movie = await find_exact_movie(guild_id, movie_title)
         if not existing_movie:
             return await ctx.send(f"'{movie_title}' doesn't exist.")
@@ -68,16 +64,16 @@ class Core(commands.Cog):
     async def endorse(self, ctx, *movie_title):
         """<movie title> — Endorse a suggestion."""
         movie_title = " ".join(movie_title)
-        user_id = await get_user_id(ctx)
-        guild_id = await get_guild_id(ctx)
+        user_id = await get_user_id(ctx, db_pool)
+        guild_id = await get_guild_id(ctx, db_pool)
         return await endorse_suggestion(ctx, guild_id, movie_title, user_id)
         
     @commands.command()
     async def unendorse(self, ctx, *movie_title):
         """<movie title> Remove endorsement."""
         movie_title = " ".join(movie_title)
-        user_id = await get_user_id(ctx)
-        guild_id = await get_guild_id(ctx)
+        user_id = await get_user_id(ctx, db_pool)
+        guild_id = await get_guild_id(ctx, db_pool)
         existing_movie = await find_exact_movie(guild_id, movie_title)
         if not existing_movie:
             return await ctx.send(f"'{movie_title}' doesn't exist.")
@@ -94,8 +90,8 @@ class Core(commands.Cog):
     @commands.command()
     async def rate(self, ctx, *movie_title_and_rating):
         """<movie title> <1-10> — Rate a movie."""
-        user_id = await get_user_id(ctx)
-        guild_id = await get_guild_id(ctx)
+        user_id = await get_user_id(ctx, db_pool)
+        guild_id = await get_guild_id(ctx, db_pool)
         movie_title = " ".join(movie_title_and_rating[:-1])
         existing_movie = await find_exact_movie(guild_id, movie_title)
         if not existing_movie:
@@ -140,8 +136,8 @@ class Core(commands.Cog):
     @commands.command()
     async def unrate(self, ctx, *movie_title):
         """<movie title> — Remove rating."""
-        user_id = await get_user_id(ctx)
-        guild_id = await get_guild_id(ctx)
+        user_id = await get_user_id(ctx, db_pool)
+        guild_id = await get_guild_id(ctx, db_pool)
         movie_title = " ".join(movie_title)
         existing_movie = await find_exact_movie(guild_id, movie_title)
         if not existing_movie:
@@ -181,8 +177,8 @@ class Core(commands.Cog):
     @commands.command()
     async def review(self, ctx, movie_title, *review_text):
         """"<movie title>" <review text> — Review a movie."""
-        user_id = await get_user_id(ctx)
-        guild_id = await get_guild_id(ctx)
+        user_id = await get_user_id(ctx, db_pool)
+        guild_id = await get_guild_id(ctx, db_pool)
         review_text = " ".join(review_text)
         existing_movie = await find_exact_movie(guild_id, movie_title)
         if not existing_movie:
@@ -220,7 +216,7 @@ class Core(commands.Cog):
         username = await user_id_to_username(ctx, user_id)
         if not username:
             username = str(row['user_id'])
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         existing_movie = await find_exact_movie(guild_id, movie_title)
         if not existing_movie:
             return await ctx.send(f"'{movie_title}' doesn't exist.")
@@ -237,7 +233,7 @@ class Core(commands.Cog):
     @commands.command()
     async def find(self, ctx, *user_input):
         """<search text> <[n,p]> — Search for users or movies."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         guild_user_info = [[member.id, member.name] for member in ctx.message.guild.members]
         user_input, pagination = await parse_squarefucker(user_input)
         user_input = " ".join(user_input)
@@ -298,7 +294,7 @@ class Core(commands.Cog):
     @commands.command()
     async def change_date_watched(self, ctx, *user_input):
         """<movie title> <yyyy-mm-dd> Change the date watched for a movienight"""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         user_input = list(user_input)
         date_watched = user_input.pop().strip()
         try:
@@ -325,7 +321,7 @@ class BrowseSuggestions(commands.Cog):
     @commands.command()
     async def suggestions(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Chronological suggestions from the server or a specific user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -373,7 +369,7 @@ class BrowseSuggestions(commands.Cog):
     @commands.command()
     async def endorsed(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Most-endorsed suggestions from the server or a specific user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -434,7 +430,7 @@ class BrowseSuggestions(commands.Cog):
     @commands.command()
     async def endorsements(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Chronological endorsements from a user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -476,7 +472,7 @@ class BrowseSuggestions(commands.Cog):
     @commands.command()
     async def random(self, ctx, *_):
         """Random movie."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             async with db_pool.acquire() as connection:
                 suggestions = await fetch_as_dict(connection, 
@@ -494,7 +490,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def movienights(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Chronological movienights from the server or a specific user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -568,7 +564,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def top_movienights(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Highest-rated movies from the server or a specific user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -639,7 +635,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def ratings(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Chronological ratings given by a user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -684,7 +680,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def top_ratings(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Highest ratings given by a user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -730,7 +726,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def unrated(self, ctx, *user_input):
         """<name or mention> <[n,p]> — Chronological unrated movies from a user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -769,7 +765,7 @@ class BrowseMovienights(commands.Cog):
     async def reviews(self, ctx, *user_input):
         """<search text> <[n,p]> — Search for reviews."""
         # uses diff user input parsing cus it expects a list of keywords
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         guild_user_info = [[member.id, member.name] for member in ctx.message.guild.members]
         user_input, pagination = await parse_squarefucker(user_input)
         if not pagination:
@@ -881,7 +877,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def standings(self, ctx, *user_input):
         """<[n,p]> — Chooser rankings (avg rating received)."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         pagination = await parse_user_input_for_number_or_pagination(user_input)
         if not pagination:
             pagination = (15,1)
@@ -933,7 +929,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def attendance(self, ctx, *user_input):
         """<[n,p]> — Movies ranked by attendance."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         pagination = await parse_user_input_for_number_or_pagination(user_input)
         if not pagination:
             pagination = (15,1)
@@ -977,7 +973,7 @@ class BrowseMovienights(commands.Cog):
     @commands.command()
     async def seen(self, ctx, *_):
         """Total movies watched in this server."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             async with db_pool.acquire() as connection:
                 rows = await fetch_as_dict(connection, 
@@ -1006,7 +1002,7 @@ class Plotting(commands.Cog):
     @commands.command()
     async def plot_ratings(self, ctx, *user_input):
         """<name or mention> — Plot ratings from a user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -1040,7 +1036,7 @@ class Plotting(commands.Cog):
     @commands.command()
     async def plot_movienights(self, ctx, *user_input):
         """<name or mention> — Plot movienights from the server or from a specific user."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -1108,7 +1104,7 @@ class Plotting(commands.Cog):
     @commands.command()
     async def plot_favorites(self, ctx, *user_input):
         """<name or mention> — Plot average ratings given from one user to each movie owner in the server."""    
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             pagination, discord_id, username = await parse_user_input_for_mention(ctx, user_input)
         except Exception as e:
@@ -1169,7 +1165,7 @@ class Plotting(commands.Cog):
     @commands.command()
     async def plot_user_similarity(self, ctx, min_common: int = 5):
         """<min_common> — Plot user rating similarity matrix. min_common (default 5) is minimum movies in common."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         try:
             async with db_pool.acquire() as connection:
                 ratings = await fetch_as_dict(connection, 
@@ -1215,7 +1211,7 @@ class Plotting(commands.Cog):
     @commands.command()
     async def plot_movie_spread(self, ctx, *movie_title):
         """<movie title> — Plot the distribution of ratings for a movie."""
-        guild_id = await get_guild_id(ctx)
+        guild_id = await get_guild_id(ctx, db_pool)
         movie_title = " ".join(movie_title)
         
         # Find the movie using existing helper
@@ -1470,22 +1466,6 @@ async def paginate(input_list, results_per_page, page_num):
     end = start + results_per_page
     return input_list[start:end]
     
-async def get_user_id(ctx):
-    """get user id from ctx. add it to db if it doesn't exist"""
-    user_id = ctx.message.author.id
-    try:
-        async with db_pool.acquire() as connection:
-            rows = await fetch_as_dict(connection, "SELECT id FROM users WHERE id = $1", user_id)
-            if rows:
-                return user_id
-            else:
-                await connection.execute("INSERT INTO users (id) values ($1)", user_id)
-                return user_id
-    except asyncpg.exceptions.PostgresError as e:
-        await ctx.send("Ruh roh database error")
-        print(f"Database error: {e}")
-        return None
-        
 async def id_from_mention(text):
     pattern = "<@!?([0-9]+)>"
     mention = re.search(pattern, text)
@@ -1533,22 +1513,6 @@ async def user_id_to_username(ctx, user_id):
         if i[0] == user_id:
             return i[1]
     return None
-            
-async def get_guild_id(ctx):
-    """get guild id from ctx. add it to db if it doesn't exist"""
-    guild_id = ctx.message.guild.id
-    try:
-        async with db_pool.acquire() as connection:
-            rows = await fetch_as_dict(connection, "SELECT id FROM guilds WHERE id=$1", guild_id)
-            if rows:
-                return guild_id
-            else:
-                await connection.execute("INSERT INTO guilds (id) values ($1)", guild_id)
-                return guild_id
-    except asyncpg.exceptions.PostgresError as e:
-        await ctx.send("Ruh roh database error")
-        print(f"Database error: {e}")
-        return None
         
 async def find_exact_movie(guild_id, movie_title):
     """finds an exact movie (case insensitive), as opposed to the best match technique in find_all()"""
@@ -1612,7 +1576,7 @@ async def movie_is_endorsed_by_user(ctx, guild_id, movie_title, endorser_user_id
         return False
 
 async def get_all_guild_movies(ctx):
-    guild_id = await get_guild_id(ctx)
+    guild_id = await get_guild_id(ctx, db_pool)
     try:
         async with db_pool.acquire() as connection:
             rows = await fetch_as_dict(connection, "SELECT * FROM movies WHERE guild_id=$1", guild_id)
@@ -1623,7 +1587,7 @@ async def get_all_guild_movies(ctx):
             return []
  
 async def get_all_guild_reviews(ctx):
-    guild_id = await get_guild_id(ctx)
+    guild_id = await get_guild_id(ctx, db_pool)
     try:
         async with db_pool.acquire() as connection:
             rows = await fetch_as_dict(connection, "SELECT * FROM reviews WHERE guild_id=$1", guild_id)
@@ -1634,7 +1598,7 @@ async def get_all_guild_reviews(ctx):
             return []
  
 async def get_all_guild_reviewed_movied(ctx):
-    guild_id = await get_guild_id(ctx)
+    guild_id = await get_guild_id(ctx, db_pool)
     try:
         async with db_pool.acquire() as connection:
             rows = await fetch_as_dict(connection, 
@@ -1754,7 +1718,7 @@ class MyHelpCommand(commands.HelpCommand):
             ("BrowseMovienights", "Browse Movienights"),
             ("Scraping", "Scraping"),
             ("Plotting", "Plotting"),
-            ("Narrate", "Voice & Narration")
+            ("Narrate", "Narrate")
         ]
         
         # These are the commands you want in each category, in the exact order:
@@ -1834,15 +1798,45 @@ class MyHelpCommand(commands.HelpCommand):
         "plot_favorites": '<name or mention> — Plot average ratings given from one user to each movie owner in the server.',
         "plot_user_similarity": '<min_common> — Plot user rating similarity matrix. min_common (default 5) is minimum movies in common.',
         "plot_movie_spread": '<movie title> — Plot the distribution of ratings for a movie.',
-        "narrate": (
-                "Voice follow + TTS narration.\n"
-                "Usage:\n"
-                "• ?narrate on #text-channel [voice] [rate]\n"
-                "• ?narrate off\n"
-                "• ?narrate status\n"
-                "• ?narrate cancel   (alias: ?narrate x)\n"
-                "• ?narrate voices [lang-code]\n"
-            )
+        "narrate on": (
+            "<#text-channel> <[voice]> <[rate]> — Enable narration and set the text channel you'll type in.\n"
+            "Examples:\n"
+            "• !narrate on #general\n"
+            "• !narrate on #watchparty en-US-Wavenet-D 1.0\n"
+            "Notes:\n"
+            "• If channel/voice/rate are omitted, your saved defaults are used.\n"
+            "• If you’re already in a voice channel, the bot will auto-join."
+        ),
+        "narrate off": (
+            "Disable narration for you.\n"
+            "Example: !narrate off"
+        ),
+        "narrate channel": (
+            "<#text-channel> — Set (or change) your default narration text channel.\n"
+            "If narration is currently on, the bot will switch to watch this channel immediately.\n"
+            "Example: !narrate channel #watchparty"
+        ),
+        "narrate voice": (
+            "<voice> <[rate]> — Set your default voice (Google full name) and optional speaking rate (0.25–4.0).\n"
+            "If narration is currently on, the new voice/rate take effect immediately.\n"
+            "Examples:\n"
+            "• !narrate voice en-US-Wavenet-D\n"
+            "• !narrate voice en-US-Chirp3-HD-Gacrux 1.0\n"
+            "Tip: Use !narrate voices to see the available names."
+        ),
+        "narrate voices": (
+            "List or link to available Google TTS voices.\n"
+            "Example: !narrate voices\n"
+            "Optional: filter by language code (e.g., en-US): !narrate voices en-US"
+        ),
+        "narrate status": (
+            "Show your narration status (enabled, channel, voice, rate) and the bot’s active narrator/VC."
+        ),
+        "narrate cancel": (
+            "Stop speaking and clear the queue for your guild.\n"
+            "Aliases: !narrate x\n"
+            "Example: !narrate cancel"
+        ),
     }
     
     async def send_bot_help(self, mapping):
@@ -1863,9 +1857,18 @@ class MyHelpCommand(commands.HelpCommand):
             # List each command in the order we specified
             lines = []
             for command in ordered_commands:
-                # Use command.help or docstring to describe it
-                help_message += f"\u001b[1;40;32m{command.name}\u001b[0;0m — {command.help or 'No description'}\n"
+                # If it's a group (e.g., 'narrate'), list its subcommands as 'narrate on', etc.
+                if isinstance(command, commands.Group):
+                    for sub in command.commands:
+                        if sub.hidden:
+                            continue
+                        qualified = f"{command.name} {sub.name}"
+                        desc = self.detailed_help.get(qualified) or sub.help or 'No description'
+                        help_message += f"\u001b[1;40;32m{qualified}\u001b[0;0m — {desc}\n"
+                else:
+                    help_message += f"\u001b[1;40;32m{command.name}\u001b[0;0m — {command.help or 'No description'}\n"
             help_message += "\n"
+
         return await send_goodly(dest, help_message)
 
     async def send_cog_help(self, cog):
@@ -1880,9 +1883,12 @@ class MyHelpCommand(commands.HelpCommand):
         """
         dest = self.get_destination()
         if command and not command.hidden:
-            command_detailed_help = self.detailed_help[command.name]
-            help_message = f"\u001b[1;40;32m{command.name}\u001b[0;0m — {command_detailed_help or 'No description'}"
+            parent = getattr(command, "full_parent_name", None)
+            key = f"{parent} {command.name}" if parent else command.name
+            command_detailed_help = self.detailed_help.get(key) or self.detailed_help.get(command.name)
+            help_message = f"\u001b[1;40;32m{key}\u001b[0;0m — {command_detailed_help or command.help or 'No description'}"
             return await send_goodly(dest, help_message)
+
 
       
 db_pool = None
