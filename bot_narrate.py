@@ -11,6 +11,7 @@ import discord
 from discord.ext import commands
 from config import google_narrate_key
 from bot_helpers import get_user_id, get_guild_id
+from db_mixin import DbMixin
 
 
 # ==========================
@@ -19,7 +20,7 @@ from bot_helpers import get_user_id, get_guild_id
 MAX_CHARS_PER_CHUNK = 180                  # small chunks → faster time-to-first-audio
 CHUNK_COALESCE_WINDOW_MS = 500             # coalesce rapid consecutive messages
 CACHE_MAX_ITEMS = 512                      # in-memory audio cache entries
-PLAYBACK_IDLE_DISCONNECT_SECS = 1200       # leave VC when idle
+PLAYBACK_IDLE_DISCONNECT_SECS = 3600       # leave VC when idle
 DEFAULT_VOICE = "en-US-Wavenet-D"          # must be a full canonical name
 DEFAULT_LANG = "en-US"
 DEFAULT_RATE = 1.0                         # 0.25–4.0 (classic voices only)
@@ -44,10 +45,6 @@ GOOGLE_TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize?ke
 # ==========================
 # Helpers
 # ==========================
-def _strip_zero_width(s: str) -> str:
-    # Removes zero-width “Cf” characters that sometimes sneak in when copying mentions
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
-
 def _message_is_narrate_command(bot: commands.Bot, content: str) -> bool:
     """Return True if the message looks like a narrate command with the bot's prefix."""
     if not content:
@@ -89,6 +86,16 @@ def chunk_text(text: str, limit: int = MAX_CHARS_PER_CHUNK) -> List[str]:
 
 
 class LRUCache:
+    """
+    Caches requests to & responses from the TTS service
+    
+    Keys (Dict[Tuple[str, str, float):
+        f"{language}:{voice}:{text}", audio_encoding, speaking_rate
+
+    Values (Tuple[bytes, int]):
+        bytes = the compressed audio returned by Google TTS (e.g., OGG/Opus).
+        int = the last-access timestamp (ms) used for LRU eviction
+    """
     def __init__(self, max_items: int):
         self.max = max_items
         self.store: Dict[Tuple[str, str, float], Tuple[bytes, int]] = {}
@@ -188,7 +195,7 @@ class GoogleTTSProvider:
 # ==========================
 # Guild voice management
 # ==========================
-class GuildVoiceSession:
+class GuildVoiceSession(DbMixin):
     """
     One voice connection + playback pipeline per guild.
     Policy = MOST-RECENT-WINS:
@@ -218,12 +225,52 @@ class GuildVoiceSession:
         # “most recent wins”
         self.active_user_id: Optional[int] = None
 
-        # recent speakers (sliding few seconds)
+        # recent speakers (sliding few seconds) (user_id, voice, time)
         self.recent_speakers: Deque[Tuple[int, str, float]] = deque(maxlen=50)
-        self.RECENT_WINDOW = 6.0  # seconds
+        self.RECENT_WINDOW = 12.0  # seconds
 
         # cached earcon bytes
         self._earcon_bytes: Optional[bytes] = None
+        
+
+    # ---------- earcon generation ----------
+    async def _get_earcon_bytes(self) -> bytes:
+        if self._earcon_bytes is not None:
+            return self._earcon_bytes
+        # Generate a tiny beep via ffmpeg synth (lavfi sine) → ogg/opus bytes
+        cmd = [
+            FFMPEG_BIN,
+            "-v", "error",
+            "-f", "lavfi",
+            "-i", f"sine=frequency={EARCON_FREQ_HZ}:duration={EARCON_DURATION_S}:sample_rate=48000",
+            "-c:a", "libopus",
+            "-b:a", "32k",
+            "-f", "ogg",
+            "pipe:1",
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+        audio_bytes, _ = proc.communicate()
+        if not audio_bytes:
+            audio_bytes = b""
+        self._earcon_bytes = audio_bytes
+        return self._earcon_bytes
+        
+    def _voices_in_recent_window(self) -> Counter:
+        """tracks recent speakers so that we can play
+        a small audio sound to differentiate 2 speakers using the same voice"""
+        now = time.time()
+        while self.recent_speakers and (now - self.recent_speakers[0][2] > self.RECENT_WINDOW):
+            self.recent_speakers.popleft()
+        seen_by_voice: Dict[str, set] = {}
+        for uid, vname, ts in self.recent_speakers:
+            seen_by_voice.setdefault(vname, set()).add(uid)
+        vc = Counter({v: len(uids) for v, uids in seen_by_voice.items()})
+        return vc
+
+    # ---------- enqueue ----------
+    async def enqueue(self, audio_bytes: bytes, user_id: int, voice_name: str, label: str, is_earcon: bool = False):
+        await self.queue.put((audio_bytes, user_id, voice_name, label, is_earcon))
+        self.last_activity = time.time()
 
     # ---------- connection & lifecycle ----------
     async def ensure_connected(self, channel: discord.VoiceChannel) -> None:
@@ -253,38 +300,33 @@ class GuildVoiceSession:
         try:
             while True:
                 await asyncio.sleep(5)
+                now = time.time()
+                idle = (now - self.last_activity) > PLAYBACK_IDLE_DISCONNECT_SECS
                 vc = self.voice_client
-                if not vc or not vc.is_connected():
-                    return
 
-                if time.time() - self.last_activity > PLAYBACK_IDLE_DISCONNECT_SECS:
-                    # --- FULL TEARDOWN on idle ---
+                if idle:
+                    # full teardown even if we're not currently in VC
                     try:
-                        # Stop any residual playback
                         try:
-                            if vc.is_playing():
+                            if vc and vc.is_connected() and vc.is_playing():
                                 vc.stop()
                         except Exception:
                             pass
-
-                        # Disconnect (we connect with reconnect=False elsewhere)
-                        await vc.disconnect(force=True)
+                        if vc and vc.is_connected():
+                            await vc.disconnect(force=True)
                     finally:
-                        # Disable narration for ALL users in this guild
                         try:
-                            pool = getattr(self.bot, "db_pool", None)
-                            if pool:
-                                async with pool.acquire() as conn:
-                                    await conn.execute(
-                                        """UPDATE narrate_prefs
-                                           SET enabled=FALSE, updated_at=CURRENT_TIMESTAMP
-                                           WHERE guild_id=$1""",
-                                        self.guild_id
-                                    )
+                            await self.db.execute("""
+                                UPDATE narrate_prefs
+                                SET enabled=FALSE, updated_at=CURRENT_TIMESTAMP
+                                WHERE guild_id=$1""",
+                                self.guild_id
+                            )
                         except Exception as e:
                             print(f"[narrate] failed to disable prefs on idle: {e}")
 
-                        # Clear local state & background tasks
+                        # TODO: !narrate status shows Active narrator (most-recent):
+                        # so maybe this isn't working?
                         self.voice_client = None
                         self.active_user_id = None
 
@@ -292,12 +334,12 @@ class GuildVoiceSession:
                             self.player_task.cancel()
                         self.player_task = None
 
-                        # cancel *this* idle task by returning
+                        # end this idle task
                         if self.idle_task and not self.idle_task.done():
                             self.idle_task.cancel()
                         self.idle_task = None
 
-                        # Drain any queued audio so nothing nudges the VC
+                        # drain any queued audio
                         try:
                             while True:
                                 self.queue.get_nowait()
@@ -305,47 +347,14 @@ class GuildVoiceSession:
                         except asyncio.QueueEmpty:
                             pass
 
-                        return  # exit the idle loop after teardown
+                        return  # exit after teardown
+
+                # not idle: if we're not connected, there’s nothing to do—stop the loop
+                if not vc or not vc.is_connected():
+                    return
         except asyncio.CancelledError:
             return
 
-
-    # ---------- earcon generation ----------
-    async def _get_earcon_bytes(self) -> bytes:
-        if self._earcon_bytes is not None:
-            return self._earcon_bytes
-        # Generate a tiny beep via ffmpeg synth (lavfi sine) → ogg/opus bytes
-        cmd = [
-            FFMPEG_BIN,
-            "-v", "error",
-            "-f", "lavfi",
-            "-i", f"sine=frequency={EARCON_FREQ_HZ}:duration={EARCON_DURATION_S}:sample_rate=48000",
-            "-c:a", "libopus",
-            "-b:a", "32k",
-            "-f", "ogg",
-            "pipe:1",
-        ]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
-        audio_bytes, _ = proc.communicate()
-        if not audio_bytes:
-            audio_bytes = b""
-        self._earcon_bytes = audio_bytes
-        return self._earcon_bytes
-
-    # ---------- enqueue ----------
-    async def enqueue(self, audio_bytes: bytes, user_id: int, voice_name: str, label: str, is_earcon: bool = False):
-        await self.queue.put((audio_bytes, user_id, voice_name, label, is_earcon))
-        self.last_activity = time.time()
-
-    def _voices_in_recent_window(self) -> Counter:
-        now = time.time()
-        while self.recent_speakers and (now - self.recent_speakers[0][2] > self.RECENT_WINDOW):
-            self.recent_speakers.popleft()
-        seen_by_voice: Dict[str, set] = {}
-        for uid, vname, ts in self.recent_speakers:
-            seen_by_voice.setdefault(vname, set()).add(uid)
-        vc = Counter({v: len(uids) for v, uids in seen_by_voice.items()})
-        return vc
 
     # ---------- playback ----------
     async def _player_loop(self):
@@ -422,7 +431,7 @@ class GuildVoiceSession:
 # ==========================
 # Cog
 # ==========================
-class NarrationCog(commands.Cog, name="Narrate"):
+class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     """
     Commands:
       !narrate on #text-channel [voice] [rate]
@@ -463,92 +472,68 @@ class NarrationCog(commands.Cog, name="Narrate"):
 
     # ---------- DB Helpers ----------
     async def _get_pref(self, guild_id: int, user_id: int) -> Optional[dict]:
-        pool = getattr(self.bot, "db_pool", None)
-        if not pool:
-            return None
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """SELECT guild_id, user_id, text_channel_id, voice, rate, enabled
-                   FROM narrate_prefs
-                   WHERE guild_id=$1 AND user_id=$2""",
-                guild_id, user_id
-            )
-            return dict(row) if row else None
+        row = await self.db.fetchrow("""
+            SELECT guild_id, user_id, text_channel_id, voice, rate, enabled
+            FROM narrate_prefs
+            WHERE guild_id=$1 AND user_id=$2""",
+            guild_id, user_id
+        )
+        return dict(row) if row else None
 
     async def _upsert_pref(
         self, guild_id: int, user_id: int, text_channel_id: int,
         voice: Optional[str], rate: Optional[float], enabled: bool
     ) -> None:
-        pool = getattr(self.bot, "db_pool", None)
-        if not pool:
-            raise RuntimeError("db_pool not available")
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """
-                INSERT INTO narrate_prefs (guild_id, user_id, text_channel_id, voice, rate, enabled)
-                VALUES ($1,$2,$3,$4,$5,$6)
-                ON CONFLICT (guild_id, user_id)
-                DO UPDATE SET text_channel_id=EXCLUDED.text_channel_id,
-                              voice=EXCLUDED.voice,
-                              rate=EXCLUDED.rate,
-                              enabled=EXCLUDED.enabled,
-                              updated_at=CURRENT_TIMESTAMP
-                """,
-                guild_id, user_id, text_channel_id, voice, rate, enabled
-            )
+        await self.db.execute("""
+            INSERT INTO narrate_prefs (guild_id, user_id, text_channel_id, voice, rate, enabled)
+            VALUES ($1,$2,$3,$4,$5,$6)
+            ON CONFLICT (guild_id, user_id)
+            DO UPDATE SET text_channel_id=EXCLUDED.text_channel_id,
+                          voice=EXCLUDED.voice,
+                          rate=EXCLUDED.rate,
+                          enabled=EXCLUDED.enabled,
+                          updated_at=CURRENT_TIMESTAMP
+            """,
+            guild_id, user_id, text_channel_id, voice, rate, enabled
+        )
 
     async def _upsert_pref_ctx(self, ctx, text_channel_id, voice, rate, enabled):
-        pool = getattr(self.bot, "db_pool", None)
-        if not pool:
-            raise RuntimeError("db_pool not available")
-        guild_id = await get_guild_id(ctx, pool)
-        user_id  = await get_user_id(ctx, pool)
+        guild_id = await get_guild_id(ctx, self.db)
+        user_id  = await get_user_id(ctx, self.db)
         if guild_id is None or user_id is None:
             return  # helpers already messaged on DB error
         await self._upsert_pref(guild_id, user_id, text_channel_id, voice, rate, enabled)
 
     async def _set_enabled(self, guild_id: int, user_id: int, enabled: bool) -> None:
-        pool = getattr(self.bot, "db_pool", None)
-        if not pool:
-            raise RuntimeError("db_pool not available")
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """UPDATE narrate_prefs
-                   SET enabled=$3, updated_at=CURRENT_TIMESTAMP
-                   WHERE guild_id=$1 AND user_id=$2""",
-                guild_id, user_id, enabled
-            )
+        await self.db.execute("""
+            UPDATE narrate_prefs
+            SET enabled=$3, updated_at=CURRENT_TIMESTAMP
+            WHERE guild_id=$1 AND user_id=$2""",
+            guild_id, user_id, enabled
+        )
             
 
     # ---------- Channel monitoring helpers ---------
     async def _enabled_user_ids(self, guild_id: int) -> List[int]:
-        pool = getattr(self.bot, "db_pool", None)
-        if not pool:
-            return []
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT user_id FROM narrate_prefs
-                   WHERE guild_id=$1 AND enabled=TRUE""",
-                guild_id
-            )
+        rows = await self.db.fetch(
+            """SELECT user_id FROM narrate_prefs
+               WHERE guild_id=$1 AND enabled=TRUE""",
+            guild_id
+        )
         return [r["user_id"] for r in rows]
     
     async def _any_enabled_in_channel(self, guild: discord.Guild, channel: discord.VoiceChannel) -> bool:
         member_ids = [m.id for m in channel.members if not m.bot]
         if not member_ids:
             return False
-        pool = getattr(self.bot, "db_pool", None)
-        if not pool:
-            return False
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """SELECT 1
-                   FROM narrate_prefs
-                   WHERE guild_id=$1 AND enabled=TRUE AND user_id = ANY($2::bigint[])
-                   LIMIT 1""",
-                guild.id, member_ids
-            )
-            return row is not None
+        row = await self.db.fetchrow("""
+            SELECT 1
+            FROM narrate_prefs
+            WHERE guild_id=$1 AND enabled=TRUE AND user_id = ANY($2::bigint[])
+            LIMIT 1""",
+            guild.id, member_ids
+        )
+        return row is not None
 
     async def _disconnect_if_no_enabled_in_channel(self, guild: discord.Guild, channel: discord.VoiceChannel, session: "GuildVoiceSession"):
         has_enabled = await self._any_enabled_in_channel(guild, channel)
@@ -720,7 +705,7 @@ class NarrationCog(commands.Cog, name="Narrate"):
         perms = channel.permissions_for(ctx.guild.me)
         if not (perms.view_channel and perms.send_messages and perms.read_message_history):
             return await ctx.send(f"I need view/send/read-history access in {channel.mention}.", suppress_embeds=True)
-
+        
         await self._upsert_pref_ctx(ctx, channel.id, v, r, pref.get("enabled") if pref else True)
         await ctx.send(f"Default narration channel set to {channel.mention}.", suppress_embeds=True)
 
@@ -765,7 +750,7 @@ class NarrationCog(commands.Cog, name="Narrate"):
         if not message.guild or message.author.bot:
             return
 
-        # Ignore our own command messages (e.g., "!narrate on …")
+        # Avoid narrating bot commands (e.g., "!narrate on …")
         if _message_is_narrate_command(self.bot, message.content):
             return
 
@@ -799,22 +784,19 @@ class NarrationCog(commands.Cog, name="Narrate"):
         else:
             self._pending_user_text[key] = (deadline, [message.content])
             
+        # await self.bot.process_commands(message) # TODO enable if shit doesn't work
+            
             
     @narrate_root.command(name="shutoff")
     @commands.has_permissions(manage_guild=True)  # optional: gate it; remove if you want anyone to run it
     async def narrate_shutoff(self, ctx: commands.Context):
-        pool = getattr(self.bot, "db_pool", None)
-        if not pool:
-            return await ctx.send("DB not available.", suppress_embeds=True)
-
         # Disable everyone for this guild
-        async with pool.acquire() as conn:
-            status = await conn.execute(
-                """UPDATE narrate_prefs
-                   SET enabled=FALSE, updated_at=CURRENT_TIMESTAMP
-                   WHERE guild_id=$1 AND enabled=TRUE""",
-                ctx.guild.id
-            )
+        status = await self.db.execute("""
+            UPDATE narrate_prefs
+            SET enabled=FALSE, updated_at=CURRENT_TIMESTAMP
+            WHERE guild_id=$1 AND enabled=TRUE""",
+            ctx.guild.id
+        )
         # asyncpg returns strings like "UPDATE 5"
         try:
             updated = int(status.split()[-1])
