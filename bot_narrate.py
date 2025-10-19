@@ -48,21 +48,31 @@ GOOGLE_TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize?ke
 # ==========================
 
 _URL_RE = re.compile(r'^(https?://\S+|www\.\S+)$', re.I)
-_CUSTOM_EMOJI_RE = re.compile(r'^<a?:\w+:\d+>$')  # <:name:id> or <a:name:id>
+_CUSTOM_EMOJI_RE = re.compile(r'^<a?:\w+:\d+>$')         # <:name:id> or <a:name:id>
+_USER_MENTION_RE = re.compile(r'^<@!?\d+>$')             # <@123> / <@!123>
+_ROLE_MENTION_RE = re.compile(r'^<@&\d+>$')              # <@&123>
+_CHANNEL_MENTION_RE = re.compile(r'^<#\d+>$')            # <#123>
 
-def _is_link_or_emoji_only(s: str) -> bool:
-    if not s:
+def _is_noise_token(t: str) -> bool:
+    return (
+        _URL_RE.match(t)
+        or _CUSTOM_EMOJI_RE.match(t)
+        or _USER_MENTION_RE.match(t)
+        or _ROLE_MENTION_RE.match(t)
+        or _CHANNEL_MENTION_RE.match(t)
+    )
+
+def _is_link_emoji_or_mention_only(s: str) -> bool:
+    if not s or not s.strip():
         return True
-    tokens = s.strip().split()
-    # Heuristic: every token is a URL OR a (custom) emoji OR purely emoji chars
-    for t in tokens:
-        if _URL_RE.match(t) or _CUSTOM_EMOJI_RE.match(t):
-            continue
-        # crude unicode-emoji check: token must contain no letters/digits
-        if any(ch.isalnum() for ch in t):
-            return False
-    return True
+    toks = s.strip().split()
+    return all(_is_noise_token(t) for t in toks)
 
+def _clean_content(s: str) -> str:
+    """Remove links, custom/unicode emoji, and mentions; keep the rest."""
+    toks = s.split()
+    kept = [t for t in toks if not _is_noise_token(t)]
+    return " ".join(kept).strip()
 
 def _message_is_narrate_command(bot: commands.Bot, content: str) -> bool:
     """Return True if the message looks like a narrate command with the bot's prefix."""
@@ -344,8 +354,6 @@ class GuildVoiceSession(DbMixin):
                         except Exception as e:
                             print(f"[narrate] failed to disable prefs on idle: {e}")
 
-                        # TODO: !narrate status shows Active narrator (most-recent):
-                        # so maybe this isn't working?
                         self.voice_client = None
                         self.active_user_id = None
 
@@ -773,7 +781,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if _message_is_narrate_command(self.bot, message.content):
             return
             
-        if _is_link_or_emoji_only(message.content):
+        # 1) hard skip if message is ONLY links/emojis/mentions
+        if _is_link_emoji_or_mention_only(message.content or ""):
             return
 
         pref = await self._get_pref(message.guild.id, message.author.id)
@@ -794,6 +803,11 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             await session.ensure_connected(member_vs.channel)
         else:
             return
+            
+         # 2) clean text by stripping links/emojis/mentions before coalescing
+        cleaned = _clean_content(message.content or "")
+        if not cleaned:
+            return  # after cleaning there's nothing meaningful left
 
         # Coalesce rapid messages
         key = (message.guild.id, message.author.id)
@@ -801,38 +815,53 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         prev = self._pending_user_text.get(key)
         if prev:
             _, parts = prev
-            parts.append(message.content)
+            parts.append(cleaned)
             self._pending_user_text[key] = (deadline, parts)
         else:
-            self._pending_user_text[key] = (deadline, [message.content])
+            self._pending_user_text[key] = (deadline, [cleaned])
             
         # await self.bot.process_commands(message) # TODO enable if shit doesn't work
             
             
     @narrate_root.command(name="shutoff")
-    @commands.has_permissions(manage_guild=True)  # optional: gate it; remove if you want anyone to run it
+    @commands.has_permissions(manage_guild=True)
     async def narrate_shutoff(self, ctx: commands.Context):
-        # Disable everyone for this guild
-        status = await self.db.execute("""
+        await self.db.execute("""
             UPDATE narrate_prefs
             SET enabled=FALSE, updated_at=CURRENT_TIMESTAMP
-            WHERE guild_id=$1 AND enabled=TRUE""",
-            ctx.guild.id
-        )
-        # asyncpg returns strings like "UPDATE 5"
-        try:
-            updated = int(status.split()[-1])
-        except Exception:
-            updated = 0
+            WHERE guild_id=$1 AND enabled=TRUE
+        """, ctx.guild.id)
 
-        # Attempt disconnect if we're in VC
         session = self._get_session(ctx.guild.id)
+
+        # 1) stop any audio first (discord.py can ignore disconnect while playing)
+        await session.cancel_playback()
+
         vc = session.voice_client
         if vc and vc.is_connected():
-            await self._disconnect_if_no_enabled_in_channel(ctx.guild, vc.channel, session)
+            try:
+                if vc.is_playing():
+                    vc.stop()
+            except Exception:
+                pass
 
-        await ctx.send(f"Shutoff complete. Disabled narrate for {updated} user(s).", suppress_embeds=True)
+            try:
+                await vc.disconnect(force=True)
+            except Exception as e:
+                # log & bail WITHOUT clearing references so another attempt can succeed
+                print(f"[narrate] disconnect failed on shutoff: {e}")
+                await ctx.send("Tried to disconnect but Discord refused; will retry shortly.", suppress_embeds=True)
+                return
 
+            # Only clear state after a successful disconnect
+            session.voice_client = None
+            session.active_user_id = None
+            if session.player_task and not session.player_task.done():
+                session.player_task.cancel()
+            session.player_task = None
+            # let idle_task end naturally when it sees vc=None
+
+        await ctx.send("Shutoff complete. Disabled narrate for everyone and disconnected.", suppress_embeds=True)
 
     # ---------- Coalescer & enqueuer ----------
     async def _coalesce_loop(self):
