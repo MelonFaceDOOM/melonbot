@@ -12,6 +12,7 @@ from discord.ext import commands
 from config import google_narrate_key
 from bot_helpers import get_user_id, get_guild_id
 from db_mixin import DbMixin
+import re
 
 
 # ==========================
@@ -45,6 +46,24 @@ GOOGLE_TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize?ke
 # ==========================
 # Helpers
 # ==========================
+
+_URL_RE = re.compile(r'^(https?://\S+|www\.\S+)$', re.I)
+_CUSTOM_EMOJI_RE = re.compile(r'^<a?:\w+:\d+>$')  # <:name:id> or <a:name:id>
+
+def _is_link_or_emoji_only(s: str) -> bool:
+    if not s:
+        return True
+    tokens = s.strip().split()
+    # Heuristic: every token is a URL OR a (custom) emoji OR purely emoji chars
+    for t in tokens:
+        if _URL_RE.match(t) or _CUSTOM_EMOJI_RE.match(t):
+            continue
+        # crude unicode-emoji check: token must contain no letters/digits
+        if any(ch.isalnum() for ch in t):
+            return False
+    return True
+
+
 def _message_is_narrate_command(bot: commands.Bot, content: str) -> bool:
     """Return True if the message looks like a narrate command with the bot's prefix."""
     if not content:
@@ -752,6 +771,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
         # Avoid narrating bot commands (e.g., "!narrate on …")
         if _message_is_narrate_command(self.bot, message.content):
+            return
+            
+        if _is_link_or_emoji_only(message.content):
             return
 
         pref = await self._get_pref(message.guild.id, message.author.id)
