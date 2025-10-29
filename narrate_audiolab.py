@@ -1,6 +1,7 @@
 # narrate_audiolab.py
 # Live audio tests (no Discord): Google TTS + ffmpeg/ffplay
 # Requires: pip install aiohttp; ffmpeg/ffplay in PATH; config.py with google_narrate_key
+# Tests Earcon (narrator labeling) and amix (overlaping audio streams)
 
 import asyncio
 import base64

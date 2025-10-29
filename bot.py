@@ -18,6 +18,8 @@ from bot_helpers import fetch_as_dict, get_user_id, get_guild_id
 from make_melonbot_db import make_db
 from db_mixin import DbMixin
 
+COMMAND_PREFIX = "!"
+
 make_db() # update db tables. creates & closes its own conn
 
 class Core(DbMixin, commands.Cog):
@@ -1881,7 +1883,7 @@ intents.message_content = True
 intents.voice_states = True
 
 bot = commands.Bot(
-    command_prefix="!",
+    command_prefix=COMMAND_PREFIX,
     case_insensitive=True,
     intents=intents,
     description="ur fav movienight companion."

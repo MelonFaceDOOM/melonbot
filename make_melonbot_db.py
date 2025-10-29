@@ -70,16 +70,30 @@ def make_db():
                 PRIMARY KEY (guild_id, user_id),
                 FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
                 FOREIGN KEY (user_id)  REFERENCES users  (id) ON DELETE CASCADE)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS google_tts_voices (
+                id SERIAL PRIMARY KEY,
+                language CITEXT NOT NULL,
+                voice_name VARCHAR(128) NOT NULL,
+                nickname VARCHAR(128),
+                gender VARCHAR(16) NOT NULL,
+                UNIQUE (voice_name))""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS google_tts_voices_lang_idx
+                ON google_tts_voices (language)""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS google_tts_voices_gender_idx
+                ON google_tts_voices (gender)""")
+    cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS google_tts_voices_nickname_ux
+                   ON google_tts_voices (nickname)""")
     cur.execute("""CREATE INDEX IF NOT EXISTS narrate_prefs_guild_enabled_idx
                 ON narrate_prefs (guild_id, enabled)""")
     cur.execute("""CREATE INDEX IF NOT EXISTS narrate_prefs_text_channel_idx
                 ON narrate_prefs (text_channel_id)""")
+
     conn.commit()
     cur.close()
     conn.close()
     
 def drop_all_tables():
-    #return # so i dont call by accident
+    return # so i dont call by accident
     try:
         conn = psycopg2.connect(**PSQL_CREDENTIALS)
         cur = conn.cursor()
