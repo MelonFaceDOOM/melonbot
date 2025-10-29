@@ -727,7 +727,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if not names:
             return await ctx.send("No nicknames found for that filter.", suppress_embeds=True)
             
-        out = f"{rows[0]["gender"]+" - " if gender_in else ""}{rows[0]["language"]} Names:\n"
+        out = f"{rows[0]['gender']+' - ' if gender_in else ''}{rows[0]['language']} Names:\n"
         out += ", ".join(names)
         if len(out) <= 1800:
             return await ctx.send(out, suppress_embeds=True)
