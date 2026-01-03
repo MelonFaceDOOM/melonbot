@@ -1,11 +1,10 @@
 import asyncio
+import asyncpg
+from pathlib import Path
 import time
 import io
 import base64
-import subprocess
-from typing import Optional, Dict, Tuple, List, Deque, Union
-from collections import deque, Counter
-import unicodedata
+from typing import Optional, Dict, Tuple, List, Union
 import aiohttp
 import discord
 from discord.ext import commands
@@ -13,7 +12,9 @@ from config import google_narrate_key
 from bot_helpers import get_user_id, get_guild_id
 from db_mixin import DbMixin
 import re
-
+import uuid
+import os
+import tempfile
 
 # ==========================
 # Tuning knobs & feature flags
@@ -127,6 +128,30 @@ def chunk_text(text: str, limit: int = MAX_CHARS_PER_CHUNK) -> List[str]:
         chunks.append(" ".join(cur))
     return chunks
 
+
+### VOICELINE SAVE/LOAD HELPERS ###
+
+def _normalize_voiceline(text: str) -> str:
+    text = text.strip()
+    text = " ".join(text.split())
+    text = text.casefold()
+    return text
+
+def _atomic_write_bytes(dest_path: Path, data: bytes) -> None:
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", dir=str(dest_path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, dest_path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 class LRUCache:
     """
@@ -445,6 +470,16 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             asyncio.create_task(self._narrate_worker(), name=f"narrate:{i}")
             for i in range(NARRATE_WORKERS)
         ]
+        self.guild_voiceline_caches: Dict[int, Dict[str, str]] = {}
+        self.persistent_audio_root = "data/audio"
+        self._last_narrated_audio: Dict[Tuple[int, int], bytes] = {}
+
+    async def cog_load(self):
+        try:
+            await self._load_keyword_cache()
+        except Exception as e:
+            print(f"[narrate] failed to load voiceline cache: {e}")
+
     def cog_unload(self):
         # Cancel background narrate workers immediately.
         for t in getattr(self, "_workers", []):
@@ -571,21 +606,6 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
         await self._upsert_pref(ctx, channel.id, voice, rate, enabled)
         return True
-        
-    async def _any_enabled_in_channel(self, guild: discord.Guild, channel: discord.VoiceChannel) -> bool:
-        member_ids = [m.id for m in channel.members if not m.bot]
-        if not member_ids:
-            return False
-        row = await self.db.fetchrow(
-            """
-            SELECT 1
-            FROM narrate_prefs
-            WHERE guild_id=$1 AND enabled=TRUE AND user_id = ANY($2::bigint[])
-            LIMIT 1
-            """,
-            guild.id, member_ids
-        )
-        return row is not None
 
     async def _disable_enabled_users_not_in_channel(self, guild: discord.Guild, channel: discord.VoiceChannel) -> None:
         # Disable everyone with enabled=TRUE who is not currently in `channel`
@@ -639,6 +659,287 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             await session.teardown()
             await self._set_all_prefs_disabled(guild_id)
 
+    async def _load_keyword_cache(self) -> Dict[int, Dict[str, str]]:
+        """
+        Loads ALL guild keyword -> voiceline filepath mappings into memory.
+
+        Cache shape:
+          self.guild_voiceline_caches[guild_id][keyword_norm] = storage_path (str)
+
+        Returns the cache dict.
+        """
+        rows = await self.db.fetch(
+            """
+            SELECT guild_id, name, storage_path
+            FROM guild_voicelines
+            """
+        )
+
+        caches: Dict[int, Dict[str, str]] = {}
+        for r in rows:
+            gid = int(r["guild_id"])
+            name_norm = _normalize_voiceline(r["name"])  # should already be normalized but make sure
+            path = r["storage_path"]  # expected to be relative to persistent_audio_root
+            caches.setdefault(gid, {})[name_norm] = path
+
+        self.guild_voiceline_caches = caches
+        return caches
+
+    async def _resolve_voiceline_override(self, guild_id: int, text: str) -> Optional[bytes]:
+        """
+        If a voiceline exists for this guild and exact text matches a saved voiceline name,
+        return its audio bytes (OGG_OPUS). Otherwise None.
+
+        Cache shape:
+          self.guild_voiceline_caches[guild_id][name_norm] = storage_path
+        """
+        name_norm = _normalize_voiceline(text)
+
+        try:
+            storage_path = self.guild_voiceline_caches[guild_id][name_norm]
+        except Exception:
+            return None
+
+        p = Path(storage_path)
+        if not p.is_absolute():
+            root = Path(getattr(self, "persistent_audio_root", "data/audio"))
+            p = root / p
+
+        if not p.exists() or not p.is_file():
+            # stale cache entry
+            try:
+                del self.guild_voiceline_caches[guild_id][name_norm]
+            except Exception:
+                pass
+            return None
+
+        # Avoid blocking the event loop on file IO
+        def _read_bytes(path: Path) -> bytes:
+            return path.read_bytes()
+
+        try:
+            return await asyncio.to_thread(_read_bytes, p)
+        except Exception:
+            return None
+
+    import asyncio
+    from pathlib import Path
+    import uuid
+    from typing import Optional
+
+    try:
+        import asyncpg  # if you're using asyncpg underneath
+    except Exception:
+        asyncpg = None
+
+    async def _save_voiceline(
+            self,
+            guild_id: int,
+            voiceline_name: str,
+            audio_bytes: bytes,
+            *,
+            created_by_user_id: Optional[int] = None,
+            fmt: str = "ogg_opus",
+            duration_ms: Optional[int] = None,
+    ) -> dict:
+        """
+        Save a voiceline for (guild_id, name_norm).
+
+        - Name is normalized with _normalize_voiceline (casefold + collapse ws).
+        - If the name already exists in this guild, raises ValueError.
+        - Saves EXACT OGG_OPUS bytes to disk (unique filename).
+        - Inserts a row into guild_voicelines.
+        - Updates in-memory cache.
+
+        Returns dict with id, name_norm, storage_path, etc.
+        """
+        if not audio_bytes:
+            raise ValueError("audio_bytes is empty")
+        if not voiceline_name or not voiceline_name.strip():
+            raise ValueError("voiceline_name is empty")
+
+        name_norm = _normalize_voiceline(voiceline_name)
+
+        # ensure FK rows exist
+        await self.db.execute(
+            "INSERT INTO guilds (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+            int(guild_id),
+        )
+        if created_by_user_id is not None:
+            await self.db.execute(
+                "INSERT INTO users (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
+                int(created_by_user_id),
+            )
+
+        # Unique file per save
+        file_id = uuid.uuid4().hex
+        storage_path = f"voicelines/{guild_id}/{file_id}.ogg"
+        root = Path(getattr(self, "persistent_audio_root", "data/audio"))
+        abs_path = root / storage_path
+
+        # write file first
+        await asyncio.to_thread(_atomic_write_bytes, abs_path, audio_bytes)
+
+        try:
+            row = await self.db.fetchrow(
+                """
+                INSERT INTO guild_voicelines (
+                    guild_id, created_by_user_id, name, storage_path, format, byte_size, duration_ms
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                RETURNING id
+                """,
+                int(guild_id),
+                int(created_by_user_id) if created_by_user_id is not None else None,
+                name_norm,  # store normalized name (your policy)
+                storage_path,
+                fmt,
+                int(len(audio_bytes)),
+                int(duration_ms) if duration_ms is not None else None,
+            )
+        except Exception as e:
+            # If name conflicts, remove the file we just wrote
+            try:
+                if abs_path.exists():
+                    abs_path.unlink()
+            except Exception:
+                pass
+
+            # Turn unique violations into a clean error message
+            # Works with asyncpg; otherwise just raise a ValueError on any conflict-ish error
+            if isinstance(e, asyncpg.UniqueViolationError):
+                raise ValueError(f"Voiceline name already exists: '{name_norm}'") from e
+            raise
+
+        # update in-memory cache
+        if not hasattr(self, "guild_voiceline_caches") or self.guild_voiceline_caches is None:
+            self.guild_voiceline_caches = {}
+        self.guild_voiceline_caches.setdefault(int(guild_id), {})[name_norm] = storage_path
+
+        return {
+            "id": int(row["id"]) if row else None,
+            "guild_id": int(guild_id),
+            "name": name_norm,
+            "name_norm": name_norm,
+            "storage_path": storage_path,
+            "byte_size": int(len(audio_bytes)),
+            "duration_ms": duration_ms,
+        }
+
+    async def _list_voicelines(self, guild_id: int, limit: int = 100) -> List[dict]:
+        rows = await self.db.fetch(
+            """
+            SELECT name, created_at, byte_size, storage_path
+            FROM guild_voicelines
+            WHERE guild_id=$1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            int(guild_id), int(limit)
+        )
+        return [dict(r) for r in rows]
+
+    async def _rename_voiceline(self, guild_id: int, old_name: str, new_name: str) -> bool:
+        """
+        Renames a voiceline within a guild.
+
+        - Uses your normalization policy (casefold + collapse whitespace) on both names.
+        - Returns False if the old name doesn't exist.
+        - Raises ValueError if the new name already exists (unique constraint) or if inputs are empty.
+        """
+        old_norm = _normalize_voiceline(old_name or "")
+        new_norm = _normalize_voiceline(new_name or "")
+        if not old_norm or not new_norm:
+            raise ValueError("old_name/new_name empty")
+        if old_norm == new_norm:
+            # No-op rename: treat as success (or return False if you prefer)
+            return True
+
+        # Fetch existing row so we can update cache by storage_path
+        row = await self.db.fetchrow(
+            """
+            SELECT storage_path
+            FROM guild_voicelines
+            WHERE guild_id=$1 AND name=$2
+            """,
+            int(guild_id), old_norm
+        )
+        if not row:
+            return False
+
+        try:
+            updated = await self.db.execute(
+                """
+                UPDATE guild_voicelines
+                SET name=$3
+                WHERE guild_id=$1 AND name=$2
+                """,
+                int(guild_id), old_norm, new_norm
+            )
+        except Exception as e:
+            # Unique conflict: new name already exists in this guild
+            msg = str(e).lower()
+            if "unique" in msg or "duplicate" in msg:
+                raise ValueError(f"Voiceline name already exists: '{new_norm}'") from e
+            raise
+
+        # Update cache (best effort)
+        try:
+            gid_cache = self.guild_voiceline_caches.get(int(guild_id), {})
+            storage_path = row["storage_path"]
+            gid_cache.pop(old_norm, None)
+            gid_cache[new_norm] = storage_path
+        except Exception:
+            pass
+        return "1" in str(updated)
+
+    async def _delete_voiceline(self, guild_id: int, name: str) -> bool:
+        name_clean = " ".join((name or "").strip().split())
+        if not name_clean:
+            raise ValueError("name empty")
+
+        row = await self.db.fetchrow(
+            """
+            SELECT storage_path
+            FROM guild_voicelines
+            WHERE guild_id=$1 AND name=$2
+            """,
+            int(guild_id), name_clean
+        )
+        if not row:
+            return False
+
+        # Delete DB row
+        deleted = await self.db.execute(
+            """
+            DELETE FROM guild_voicelines
+            WHERE guild_id=$1 AND name=$2
+            """,
+            int(guild_id), name_clean
+        )
+
+        # Remove from cache
+        try:
+            gid_cache = self.guild_voiceline_caches.get(int(guild_id), {})
+            gid_cache.pop(_normalize_voiceline(name_clean), None)
+        except Exception:
+            pass
+
+        # Delete file (safe because you use unique per-save filenames)
+        try:
+            storage_path = row["storage_path"]
+            p = Path(storage_path)
+            if not p.is_absolute():
+                root = Path(getattr(self, "persistent_audio_root", "data/audio"))
+                p = root / p
+            if p.exists() and p.is_file():
+                p.unlink()
+        except Exception as e:
+            # Not fatal if the DB row is gone
+            print(f"[narrate] failed to delete voiceline file for {name_clean}: {e}")
+
+        return "1" in str(deleted)
+
 
     # ---------- Commands ----------
     @commands.group(name="narrate", invoke_without_command=True)
@@ -653,6 +954,10 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "  !narrate voice <voice-name|short-name>\n"
             "  !narrate voices [language] [gender]\n"
             "  !narrate rate <float>\n"
+            "  !narrate save <voiceline-name>      (saves your most recently narrated audio)\n"
+            "  !narrate list                       (lists saved voicelines for this server)\n"
+            "  !narrate rename <old> <new>\n"
+            "  !narrate delete <voiceline-name>\n"
             "  !narrate shutoff"
         )
         await ctx.send(usage, suppress_embeds=True)
@@ -708,15 +1013,15 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         params = [f"%{lang_in}%"]
 
         sql = """
-          SELECT nickname, language, gender
-          FROM google_tts_voices
-          WHERE language ILIKE $1
-        """
+              SELECT nickname, language, gender
+              FROM google_tts_voices
+              WHERE language ILIKE $1
+            """
         if gender_in:
             sql += " AND gender = $2"
             params.append(gender_in)
 
-        sql += " ORDER BY nickname"
+            sql += " ORDER BY nickname"
 
         rows = await self.db.fetch(sql, *params)
         if not rows:
@@ -726,8 +1031,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         names = [r["nickname"] for r in rows if r["nickname"]]
         if not names:
             return await ctx.send("No nicknames found for that filter.", suppress_embeds=True)
-            
-        out = f"{rows[0]['gender']+' - ' if gender_in else ''}{rows[0]['language']} Names:\n"
+
+        out = f"{rows[0]["gender"]+" - " if gender_in else ""}{rows[0]["language"]} Names:\n"
         out += ", ".join(names)
         if len(out) <= 1800:
             return await ctx.send(out, suppress_embeds=True)
@@ -909,7 +1214,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
             # If nobody remaining in the bot VC has narrate enabled → shut down
             try:
-                still_has_enabled = await self._any_enabled_in_channel(guild, bot_chan) if bot_chan else False
+                still_has_enabled = await self._any_enabled_in_channel(guild.id, bot_chan) if bot_chan else False
             except Exception as e:
                 print(f"[narrate] enabled check error: {e}")
                 still_has_enabled = True  # be conservative
@@ -968,6 +1273,95 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             rate = DEFAULT_RATE
         await self._narrate_queue.put((message.guild.id, message.author.id, cleaned, voice, language_code, rate, message.channel.id))
 
+    @narrate_root.command(name="save")
+    async def narrate_save(self, ctx: commands.Context, *, voiceline_name: str):
+        guild_id = await get_guild_id(ctx, self.db)
+        user_id = await get_user_id(ctx, self.db)
+        if guild_id is None or user_id is None:
+            return
+
+        audio = self._last_narrated_audio.get((guild_id, user_id))
+        if not audio:
+            return await ctx.send(
+                "No recent narrated audio found for you in this server.",
+                suppress_embeds=True,
+            )
+
+        try:
+            saved = await self._save_voiceline(
+                guild_id=guild_id,
+                voiceline_name=voiceline_name,
+                audio_bytes=audio,
+                created_by_user_id=user_id,
+                fmt="ogg_opus",
+            )
+        except Exception as e:
+            return await ctx.send(f"Failed to save voiceline: {e}", suppress_embeds=True)
+
+        final_name = saved["name"]
+        await ctx.send(f"Saved voiceline as `{final_name}`.", suppress_embeds=True)
+
+    @narrate_root.command(name="list")
+    async def narrate_list(self, ctx: commands.Context):
+        guild_id = await get_guild_id(ctx, self.db)
+        if guild_id is None:
+            return
+
+        try:
+            rows = await self._list_voicelines(guild_id, limit=100)
+        except Exception as e:
+            return await ctx.send(f"Failed to list voicelines: {e}", suppress_embeds=True)
+
+        if not rows:
+            return await ctx.send("No voicelines saved in this server.", suppress_embeds=True)
+
+        # Format conservatively for Discord limits
+        lines = ["Saved voicelines (most recent first):"]
+        for r in rows:
+            nm = r["name"]
+            sz = r["byte_size"]
+            lines.append(f"- `{nm}` ({sz} bytes)")
+            if len("\n".join(lines)) > 1800:
+                lines.append("… (truncated)")
+                break
+
+        await ctx.send("\n".join(lines), suppress_embeds=True)
+
+    @narrate_root.command(name="rename")
+    async def narrate_rename(self, ctx: commands.Context, old_name: str, *, new_name: str):
+        guild_id = await get_guild_id(ctx, self.db)
+        user_id = await get_user_id(ctx, self.db)
+        if guild_id is None or user_id is None:
+            return
+
+        try:
+            ok = await self._rename_voiceline(guild_id, old_name, new_name)
+        except Exception as e:
+            # If this is a unique conflict, postgres will raise; surface a clear message
+            return await ctx.send(f"Rename failed: {e}", suppress_embeds=True)
+
+        if not ok:
+            return await ctx.send(f"No voiceline named `{old_name}` found.", suppress_embeds=True)
+
+        await ctx.send(f"Renamed `{old_name}` → `{new_name}`.", suppress_embeds=True)
+
+    @narrate_root.command(name="delete", aliases=["del", "rm"])
+    async def narrate_delete(self, ctx: commands.Context, *, name: str):
+        guild_id = await get_guild_id(ctx, self.db)
+        user_id = await get_user_id(ctx, self.db)
+        if guild_id is None or user_id is None:
+            return
+
+        try:
+            ok = await self._delete_voiceline(guild_id, name)
+        except Exception as e:
+            return await ctx.send(f"Delete failed: {e}", suppress_embeds=True)
+
+        if not ok:
+            return await ctx.send(f"No voiceline named `{name}` found.", suppress_embeds=True)
+
+        await ctx.send(f"Deleted voiceline `{name}`.", suppress_embeds=True)
+
     async def _narrate_worker(self):
         try:
             while True:
@@ -983,6 +1377,25 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                     if not member or not (member.voice and member.voice.channel):
                         continue
 
+                    ### CHECK IF VOICELINE EXISTS (in which case tts api won't be called) ###
+                    try:
+                        voiceline_data = await self._resolve_voiceline_override(
+                            guild_id=guild_id,
+                            text=text
+                        )  # returns None if no voiceline found
+                    except Exception as e:
+                        ch = guild.get_channel(channel_id)
+                        if ch:
+                            try:
+                                await ch.send(
+                                    "Voiceline retrieval failed",
+                                    suppress_embeds=True,
+                                )
+                            except Exception:
+                                pass
+                        voiceline_data = None
+                        print(f"something fucky happened with voiceline retrieval check {text}: {e}")
+
                     async with self._guild_lock(guild_id):
                         session = self._get_session(guild_id)
                         try:
@@ -991,33 +1404,37 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                             print(f"[narrate] ensure_connected error: {e}")
                             continue
 
-                        chunks = chunk_text(text, MAX_CHARS_PER_CHUNK)
-                        if not chunks:
-                            continue
+                        if voiceline_data:
+                            self._last_narrated_audio[(guild_id, user_id)] = voiceline_data
+                            await session.enqueue(voiceline_data)
+                        else:
+                            # NO voiceline data -- do normal tts api call
+                            chunks = chunk_text(text, MAX_CHARS_PER_CHUNK)
+                            if not chunks:
+                                continue
 
-                        async def synth_chunk(t: str) -> bytes:
-                            return await self.tts.synth(
-                                t, voice_name=voice, language_code=language_code, speaking_rate=rate
-                            )
+                            async def synth_chunk(t: str) -> bytes:
+                                return await self.tts.synth(
+                                    t, voice_name=voice, language_code=language_code, speaking_rate=rate
+                                )
 
-                        try:
-                            for part in chunks:
-                                data = await synth_chunk(part)
-                                await session.enqueue(data)
-                        except Exception as e:
-                            ch = guild.get_channel(channel_id)
-                            if ch:
-                                try:
-                                    await ch.send(
-                                        "TTS failed. Ensure you used the exact **Name** from Google’s voice list "
-                                        "(e.g., `en-US-Wavenet-D` or `en-US-Chirp3-HD-Gacrux`).\n"
-                                        "See: https://cloud.google.com/text-to-speech/docs/voices",
-                                        suppress_embeds=True,
-                                    )
-                                except Exception:
-                                    pass
-                            print(f"[narrate] synth error: {e}")
-                            continue
+                            try:
+                                for part in chunks:
+                                    data = await synth_chunk(part)
+                                    self._last_narrated_audio[(guild_id, user_id)] = data
+                                    await session.enqueue(data)
+                            except Exception as e:
+                                ch = guild.get_channel(channel_id)
+                                if ch:
+                                    try:
+                                        await ch.send(
+                                            "TTS failed.",
+                                            suppress_embeds=True,
+                                        )
+                                    except Exception:
+                                        pass
+                                print(f"[narrate] synth error: {e}")
+                                continue
                 finally:
                     self._narrate_queue.task_done()
         except asyncio.CancelledError:

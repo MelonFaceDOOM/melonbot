@@ -4,4 +4,8 @@ config.py
 .idea/
 .git/
 .pytest_cache
-.log"*.iml"  
+.log"*.iml"
+
+# Bot-generated audio
+data/audio/
+*.ogg
