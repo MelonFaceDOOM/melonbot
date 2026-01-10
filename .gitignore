@@ -5,7 +5,7 @@ config.py
 .git/
 .pytest_cache
 .log"*.iml"
-
+data/streams/
 # Bot-generated audio
 data/audio/
 *.ogg
