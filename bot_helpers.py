@@ -36,3 +36,32 @@ async def get_guild_id(ctx, db_pool):
         await ctx.send("Ruh roh database error")
         print(f"Database error: {e}")
         return None
+
+async def send_goodly(ctx, message):
+    """standard way of sending a MESSAGE to the stupid user"""
+    try:
+        messages = await _chunk(message)
+    except ValueError as e:
+        return await ctx.send(f"somehow the basic way i am supposed to send messages broke that is very bad.\n{e}")
+    for message in messages:
+        await ctx.send("```ansi\n" + message + "```")
+
+async def _chunk(message, max_length=1900):
+    """returns list of strings
+    each chunk is either max_length or was separated by a newline in the original message"""
+    chunks = []
+    while message:
+        chunk = ""
+        newline_pos = None
+        while (len(chunk) <= max_length) and message:
+            character = message[0]
+            message = message[1:]
+            chunk += character
+            if character == "\n":
+                newline_pos = len(chunk)
+        if newline_pos and message:
+            extra = chunk[newline_pos:]
+            message = extra + message
+            chunk = chunk[:newline_pos - 1]
+        chunks.append(chunk)
+    return chunks

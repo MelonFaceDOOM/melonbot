@@ -1,8 +1,6 @@
 import re
 import datetime
 import asyncpg
-import statistics
-import math
 from random import choice
 from collections import defaultdict
 from discord.ext import commands
@@ -14,7 +12,8 @@ from config import bot_token, PSQL_CREDENTIALS
 from scraping.ebert import ebert_lookup
 import plotting
 from bot_narrate import NarrationCog
-from bot_helpers import fetch_as_dict, get_user_id, get_guild_id
+from bot_helpers import get_user_id, get_guild_id, send_goodly
+from bot_stream_tracker import StreamTrackerCog
 from make_melonbot_db import make_db
 from db_mixin import DbMixin
 
@@ -1261,8 +1260,8 @@ class Plotting(DbMixin, commands.Cog):
         for r in ratings:
             name = user_ids_and_names.get(r['user_id']) or await user_id_to_username(ctx, r['user_id']) or str(r['user_id'])
             if name is None:
-                name = await user_id_to_username(ctx, owner_id) or str(owner_id)
-                user_ids_and_names[owner_id] = name
+                name = await user_id_to_username(ctx, r['user_id']) or str(r['user_id'])
+                user_ids_and_names[r['user_id']] = name
             rows.append({'title': r['title'], 'user_id': r['user_id'], 'date_watched': r['date_watched'], 'rating': r['rating'], 'username': name})            
         image_buffer = plotting.plot_ratings_to_users(rows)
         return await ctx.send(file=File(fp=image_buffer, filename="ratings_plot.png"))        
@@ -1477,35 +1476,6 @@ class Plotting(DbMixin, commands.Cog):
             print(f"Plotting error: {e}")
             return await ctx.send("Failed to generate plot.")
 
-async def send_goodly(ctx, message):
-    """standard way of sending a MESSAGE to the stupid user"""
-    try:
-        messages = await chunk(message)
-    except ValueError as e:
-        return await ctx.send(f"somehow the basic way i am supposed to send messages broke that is very bad.\n{e}")
-    for message in messages:
-        await ctx.send("```ansi\n" + message + "```")
-        
-async def chunk(message, max_length=1900):
-    """returns list of strings
-    each chunk is either max_length or was separated by a newline in the original message"""
-    chunks = []
-    while message:
-        chunk = ""
-        newline_pos = None
-        while (len(chunk) <= max_length) and message:
-            character = message[0]
-            message = message[1:]
-            chunk += character
-            if character == "\n":
-                newline_pos = len(chunk)
-        if newline_pos and message:
-            extra = chunk[newline_pos:]
-            message = extra + message
-            chunk = chunk[:newline_pos - 1]
-        chunks.append(chunk)
-    return chunks
-    
 
 async def parse_user_input_for_number_or_pagination(user_input):
     """parses user input where a number or pagination squarefucker is expected"""
@@ -1583,7 +1553,6 @@ async def parse_squarefucker(user_input):
     # the problem is that discord splits arguments on spaces, so i would have to...
     # try joining the last few args and then seeing if that's a match and that's...
     # just a bit more of a pain than i want to deal with right now
-    is_negative = False
     results_per_page = None
     page_num = None
     for i in user_input:
@@ -1687,12 +1656,9 @@ async def get_ratings_for_movie_ids(db, ctx, guild_id, movie_ids):
         await ctx.send("Ruh roh database error")
         print(f"Database error: {e}")
         return []
-        
 
 
-
-
-class MyHelpCommand(commands.HelpCommand):
+class BotHelpCommand(commands.HelpCommand):
     def __init__(self):
         super().__init__()
         self.cog_order = [
@@ -1876,24 +1842,64 @@ class MyHelpCommand(commands.HelpCommand):
             return await send_goodly(dest, help_message)
 
 
-      
+class BottyBoy(commands.Bot):
+    """
+    Adds a centralized async shutdown hook:
+      - calls `aclose()` on any cog that defines it
+      - closes bot.db_pool if present
+    """
+    async def close(self) -> None:
+        # 1) Let cogs clean up (aiohttp sessions, background tasks, etc.)
+        for cog in list(self.cogs.values()):
+            aclose = getattr(cog, "aclose", None)
+            # TODO: define aclose in each cog as a new standard closing/cleanup func
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception as e:
+                    print(f"[shutdown] cog {cog.qualified_name} aclose() failed: {e}")
+
+        # 2) Close DB pool
+        pool = getattr(self, "db_pool", None)
+        if pool is not None:
+            try:
+                await pool.close()
+            except Exception as e:
+                print(f"[shutdown] db_pool.close() failed: {e}")
+            finally:
+                self.db_pool = None
+
+        # 3) Finish discord.py shutdown
+        await super().close()
+
+
+# ----------------------------
+# Intents
+# ----------------------------
+
 intents = Intents.default()
 intents.members = True
 intents.message_content = True
 intents.voice_states = True
 
-bot = commands.Bot(
+
+# ----------------------------
+# Bot setup
+# ----------------------------
+
+bot = BottyBoy(
     command_prefix=COMMAND_PREFIX,
     case_insensitive=True,
     intents=intents,
-    description="ur fav movienight companion."
+    description="ur fav movienight companion.",
 )
 
-bot.help_command = MyHelpCommand()
+bot.help_command = BotHelpCommand()
+
 
 @bot.event
 async def setup_hook():
-    # runs once before on_ready; guaranteed not to repeat on reconnect
+    # Runs once before on_ready; guaranteed not to repeat on reconnect.
     try:
         bot.db_pool = await asyncpg.create_pool(**PSQL_CREDENTIALS)
         print("Database connection pool created successfully.")
@@ -1901,21 +1907,21 @@ async def setup_hook():
         print(f"Failed to connect to the database: {e}")
         bot.db_pool = None
 
+    # Load cogs
     await bot.add_cog(Core(bot))
     await bot.add_cog(BrowseSuggestions(bot))
     await bot.add_cog(BrowseMovienights(bot))
     await bot.add_cog(Scraping(bot))
     await bot.add_cog(Plotting(bot))
     await bot.add_cog(NarrationCog(bot))
+    await bot.add_cog(StreamTrackerCog(bot))
+
     print("cogs added")
-    
-@bot.event
-async def on_close():
-    if getattr(bot, "db_pool", None):
-        await bot.db_pool.close()
+
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (reconnected ok)")
-    
+
+
 bot.run(bot_token)

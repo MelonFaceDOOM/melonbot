@@ -11,7 +11,6 @@ def apply_migration():
     cur = conn.cursor()
 
     cur.execute("""CREATE EXTENSION IF NOT EXISTS citext;""")
-    # 2) A saved voiceline instance (guild-scoped) that points to an audio blob
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS guild_voicelines (
@@ -31,7 +30,6 @@ def apply_migration():
         """
     )
 
-    # Indexes for fast lookups and basic admin queries
     cur.execute(
         """
         CREATE INDEX IF NOT EXISTS guild_voicelines_guild_idx

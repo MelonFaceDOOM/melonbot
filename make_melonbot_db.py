@@ -147,7 +147,7 @@ def insert_dicts_into_psql(pcur, table_name, dicts):
 def transfer_from_sqlite():
     pconn = psycopg2.connect(**PSQL_CREDENTIALS)
     pcur = pconn.cursor()
-    sqlite_filename = "melonbot.db"
+    sqlite_filename = "misc/melonbot.db"
     conn = sqlite3.connect(sqlite_filename)
     conn.row_factory = dict_factory
     cur = conn.cursor()
