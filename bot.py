@@ -17,7 +17,7 @@ from bot_stream_tracker import StreamTrackerCog
 from make_melonbot_db import make_db
 from db_mixin import DbMixin
 
-COMMAND_PREFIX = "?"
+COMMAND_PREFIX = "!"
 
 make_db() # update db tables. creates & closes its own conn
 

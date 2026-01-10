@@ -9,3 +9,4 @@ data/streams/
 # Bot-generated audio
 data/audio/
 *.ogg
+log.txt
