@@ -11,7 +11,6 @@ import os
 import logging
 import sys
 
-from config import SFTP_CREDENTIALS, STREAMLINK_BIN
 import asyncpg
 
 # ---------------------------------------------------------------------
@@ -26,12 +25,6 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("stream_tracker")
-
-# ---------------------------------------------------------------------
-# some vars/setup (shoulda moved more here tbh)
-# ---------------------------------------------------------------------
-
-streamlink_bin = STREAMLINK_BIN
 
 # ---------------------------------------------------------------------
 # DB setup
@@ -412,20 +405,27 @@ async def record_stream_with_streamlink(
         "--- RECORDING STARTED --- login=%s channel_id=%s stream_id=%s seg=%s out=%s",
         live.login, live.channel_id, live.twitch_stream_id, segment_idx, local_path
     )
-    logger.info("streamlink_bin=%r quality=%r url=%r", streamlink_bin, quality, url)
 
     proc = await asyncio.create_subprocess_exec(
-        streamlink_bin,
-        url,
-        quality,
-        "-o",
-        str(local_path),
+        sys.executable, "-m", "streamlink",
+        url, quality, "-o", str(local_path),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
+    #proc = await asyncio.create_subprocess_exec(
+    #    streamlink_bin,
+    #    url,
+    #    quality,
+    #    "-o",
+    #    str(local_path),
+    #    stdout=asyncio.subprocess.PIPE,
+    #    stderr=asyncio.subprocess.PIPE,
+    #)
+
     logger.info("streamlink spawned pid=%s", proc.pid)
-    segment_timeout_s = float(os.environ.get("STREAMLINK_SEGMENT_SECONDS", 60)) # str(10 * 3600)
-    if segment_timeout_s < 60:  # TODO: change to 600
+    segment_timeout_s = float(os.environ.get("STREAMLINK_SEGMENT_SECONDS", str(10 * 3600)) 
+    if segment_timeout_s < 60: 
         raise ValueError("STREAMLINK_SEGMENT_SECONDS should be at least 60 seconds")
 
     was_timeout = False

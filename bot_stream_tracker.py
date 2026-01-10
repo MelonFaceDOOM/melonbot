@@ -687,12 +687,12 @@ class StreamTrackerCog(DbMixin, commands.Cog, name="StreamTracker"):
             lines.append(f"- `#{r['id']}` **{login}** — {created_s} — seg={seg} — {st}")
             lines.append(_line2_link_or_inferred_status(r))
 
-        await send_goodly(ctx, "\n".join(lines))
+        await ctx.send("\n".join(lines))
 
     # 5) list streams from channel (scoped to guild-tracked channels)
     @stream_root.command(name="channel_vods")
     @commands.guild_only()
-    async def cmd_list_streams_for_channel(self, ctx: commands.Context, login_or_url: str, limit: int = 20):
+    async def cmd_list_streams_for_channel(self, ctx: commands.Context, login_or_url: str, limit: int = 5):
         gid = await get_guild_id(ctx, self.db)
 
         try:
@@ -735,12 +735,11 @@ class StreamTrackerCog(DbMixin, commands.Cog, name="StreamTracker"):
             created_s = _fmt_dt(r.get("created_at"))
             seg = r.get("segment_idx")
             st = r.get("status") or "?"
-            sid = r.get("twitch_stream_id") or "?"
 
-            lines.append(f"- `#{r['id']}` — {created_s} — {size_s} — seg={seg} — {st} — stream_id={sid}")
+            lines.append(f"- `#{r['id']}` — {created_s} — seg={seg} — {st}")
             lines.append(_line2_link_or_inferred_status(r))
 
-        await send_goodly(ctx, "\n".join(lines))
+        await ctx.send("\n".join(lines))
 
     @stream_root.command(name="delete")
     async def cmd_delete_streams(self, ctx: commands.Context, *, stream_ids: str):
