@@ -424,7 +424,7 @@ async def record_stream_with_streamlink(
     #)
 
     logger.info("streamlink spawned pid=%s", proc.pid)
-    segment_timeout_s = float(os.environ.get("STREAMLINK_SEGMENT_SECONDS", str(10 * 3600)) 
+    segment_timeout_s = float(os.environ.get("STREAMLINK_SEGMENT_SECONDS", str(10 * 3600)))
     if segment_timeout_s < 60: 
         raise ValueError("STREAMLINK_SEGMENT_SECONDS should be at least 60 seconds")
 
