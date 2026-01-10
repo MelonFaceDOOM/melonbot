@@ -564,6 +564,7 @@ class StreamTrackerCog(DbMixin, commands.Cog, name="StreamTracker"):
                     FROM stream_tracker.saved_streams ss
                     JOIN stream_tracker.channels c ON c.id = ss.channel_id
                     WHERE ss.channel_id = $1
+                        AND ss.status <> 'pending'
                     ORDER BY ss.created_at DESC
                     """,
                     cid,
