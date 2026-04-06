@@ -100,7 +100,18 @@ def _norm_gender(s: Optional[str]) -> Optional[str]:
 
 def _collapse_ws(s: str) -> str:
     return " ".join(s.split())
-    
+
+def _strip_parenthetical_for_tts(s: str) -> str:
+    """Remove (...) segments (including nested) before TTS; collapse whitespace."""
+    s = s.strip()
+    while True:
+        new_s = re.sub(r"\([^()]*\)", "", s)
+        if new_s == s:
+            break
+        s = new_s
+    s = re.sub(r"\s+([.,;:!?])", r"\1", s)
+    return _collapse_ws(s).strip()
+
 def _short_voice_name(voice_name: str) -> str:
     # Strip the leading "<lang>-<REGION>-" prefix, keep the rest.
     # Examples:
@@ -1261,7 +1272,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if not (message.author.voice and message.author.voice.channel):
             return
 
-        cleaned = _clean_content(message.content or "")
+        cleaned = _strip_parenthetical_for_tts(_clean_content(message.content or ""))
         if not cleaned:
             return
 

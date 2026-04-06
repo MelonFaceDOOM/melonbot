@@ -1,3 +1,6 @@
+# TODO: big annoyance at the moment is once a stream begins being recorded,
+# it won't be interrupted if we stop tracking that stream
+# maybe add a system to keep checking if something is tracked and then kill recording if it appears to be untracked
 from __future__ import annotations
 import asyncio
 import aiohttp
@@ -17,7 +20,7 @@ import asyncpg
 # logging setup
 # ---------------------------------------------------------------------
 
-DEBUG = True
+DEBUG = False
 LOG_LEVEL = "DEBUG" if DEBUG else "INFO"
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -106,19 +109,34 @@ async def db_try_claim_next_segment(live: LiveStream) -> Optional[Tuple[int, int
 
     async with _pool().acquire() as conn:
         async with conn.transaction():
-            # If any active-ish row exists, ignore.
-            active = await conn.fetchval(
+            
+            await conn.execute(
                 """
-                SELECT 1
+                UPDATE stream_tracker.saved_streams
+                SET status='failed'
+                WHERE channel_id=$1 AND twitch_stream_id=$2
+                  AND status='pending'
+                  AND created_at < now() - interval '15 minutes'
+                """,
+                cid, sid,
+            )
+            # If any active-ish row exists, ignore.
+            active = await conn.fetchrow(
+                """
+                SELECT id, segment_idx, status, created_at
                 FROM stream_tracker.saved_streams
                 WHERE channel_id=$1 AND twitch_stream_id=$2
-                  AND status IN ('pending','complete')
+                  AND status IN ('pending')
+                ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                cid, sid
+                cid, sid,
             )
             if active:
-                logger.info("db_claim ignore: pending/complete exists channel_id=%s stream_id=%s", cid, sid)
+                logger.info(
+                    "db_claim ignore: active exists id=%s seg=%s status=%s created_at=%s channel_id=%s stream_id=%s",
+                    active["id"], active["segment_idx"], active["status"], active["created_at"], cid, sid
+                )
                 return None
 
             # Look at latest segment (if any)
@@ -136,8 +154,8 @@ async def db_try_claim_next_segment(live: LiveStream) -> Optional[Tuple[int, int
             if latest is None:
                 next_idx = 1
             else:
-                if str(latest["status"]) not in ("partial", "failed"):
-                    logger.info("db_claim ignore: latest status=%s (not partial) channel_id=%s stream_id=%s",
+                if str(latest["status"]) not in ("partial", "failed", "complete"):
+                    logger.info("db_claim ignore: latest status=%s (not partial, failed, or complete) channel_id=%s stream_id=%s",
                                 latest["status"], cid, sid)
                     return None
                 next_idx = int(latest["segment_idx"]) + 1
