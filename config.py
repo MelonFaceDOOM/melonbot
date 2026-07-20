@@ -5,12 +5,23 @@ Flip MELONBOT_DB and USE_SSH_TUNNEL at the top of `.env`; everything else follow
 """
 
 import os
+from pathlib import Path
+
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+
+    # Always load repo-root .env (not cwd). override=False keeps real shell exports.
+    loaded = load_dotenv(_ENV_PATH, override=False)
+    if not loaded and not _ENV_PATH.is_file():
+        print(f"warning: no .env at {_ENV_PATH}", flush=True)
+except ImportError:
+    print(
+        "warning: python-dotenv not installed; .env will not be loaded. "
+        "pip install python-dotenv",
+        flush=True,
+    )
 
 
 def _flag(name: str) -> bool:
