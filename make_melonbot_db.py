@@ -11,10 +11,27 @@ def make_db():
     cur.execute("""CREATE EXTENSION IF NOT EXISTS citext""")
     cur.execute("""CREATE TABLE IF NOT EXISTS guilds (
                 id BIGINT PRIMARY KEY NOT NULL,
-                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                name VARCHAR(128),
+                icon_url TEXT,
+                updated_at TIMESTAMP)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS users (
                 id BIGINT PRIMARY KEY NOT NULL,
-                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                username VARCHAR(64),
+                global_name VARCHAR(64),
+                updated_at TIMESTAMP)""")
+    # Existing DBs created before display-name cache: add columns if missing.
+    cur.execute("""
+        ALTER TABLE guilds
+          ADD COLUMN IF NOT EXISTS name VARCHAR(128),
+          ADD COLUMN IF NOT EXISTS icon_url TEXT,
+          ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP""")
+    cur.execute("""
+        ALTER TABLE users
+          ADD COLUMN IF NOT EXISTS username VARCHAR(64),
+          ADD COLUMN IF NOT EXISTS global_name VARCHAR(64),
+          ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP""")
     cur.execute("""CREATE TABLE IF NOT EXISTS movies (
                 id SERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,

@@ -81,10 +81,12 @@ pyparsing==3.2.0
 pyreadline3==3.5.4
 python-dateutil==2.9.0.post0
 python-dotenv==1.1.0
+sshtunnel==0.4.0
 pytz==2024.1
 PyYAML==6.0.2
 regex==2024.11.6
 requests==2.32.3
+curl_cffi==0.13.0
 rsa==4.9
 scipy==1.16.2
 seaborn==0.13.2

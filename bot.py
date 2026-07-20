@@ -8,23 +8,75 @@ from discord.utils import get
 from discord import Intents
 from discord import File
 from matching import find_closest_match_and_score, rank_matches
-from config import bot_token, PSQL_CREDENTIALS
+from config import bot_token, PSQL_CREDENTIALS, COMMAND_PREFIX
 from scraping.ebert import ebert_lookup
 import plotting
 from bot_narrate import NarrationCog
-from bot_helpers import get_user_id, get_guild_id, send_goodly
+from bot_helpers import get_user_id, get_guild_id, send_goodly, upsert_guild, upsert_user
 from bot_stream_tracker import StreamTrackerCog
 from make_melonbot_db import make_db
 from db_mixin import DbMixin
-
-COMMAND_PREFIX = "!"
 
 make_db() # update db tables. creates & closes its own conn
 
 class Core(DbMixin, commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-    
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild):
+        await upsert_guild(self.db, guild)
+
+    @commands.Cog.listener()
+    async def on_guild_update(self, before, after):
+        if before.name != after.name or before.icon != after.icon:
+            await upsert_guild(self.db, after)
+
+    @commands.Cog.listener()
+    async def on_user_update(self, before, after):
+        if before.name != after.name or before.global_name != after.global_name:
+            await upsert_user(self.db, after)
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        if before.name != after.name or before.global_name != after.global_name:
+            await upsert_user(self.db, after)
+
+    @commands.command(name="sync_names")
+    @commands.is_owner()
+    async def sync_names(self, ctx):
+        """Owner only — backfill guild/user display names from Discord into the DB."""
+        guilds_updated = 0
+        users_updated = 0
+        seen_user_ids = set()
+        try:
+            known_user_ids = {
+                row["id"] for row in await self.db.fetch("SELECT id FROM users")
+            }
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error reading users.")
+
+        for guild in self.bot.guilds:
+            if await upsert_guild(self.db, guild) is not None:
+                guilds_updated += 1
+            for member in guild.members:
+                if member.bot:
+                    continue
+                if member.id not in known_user_ids:
+                    continue
+                if await upsert_user(self.db, member) is not None:
+                    users_updated += 1
+                    seen_user_ids.add(member.id)
+
+        users_missing = len(known_user_ids - seen_user_ids)
+        return await send_goodly(
+            ctx,
+            f"sync_names: {guilds_updated} guild(s), "
+            f"{users_updated} user upsert(s), "
+            f"{users_missing} user(s) in DB not found in any shared guild.",
+        )
+
     @commands.command()
     async def add(self, ctx, *movie_title):
         """<movie title> — Add a movienight suggestion."""
@@ -1516,12 +1568,13 @@ async def parse_user_input_for_mention(db, ctx, user_input):
 async def name_or_mention_to_id(db, ctx, name_or_mention):
     """when provided with a user's name or an @, find the user id.
        good for funcs where user is expected to supply a member name as an argument"""
-    guild_user_info = [[member.id, member.name] for member in ctx.message.guild.members]
+    guild = ctx.message.guild
+    members_by_id = {member.id: member for member in guild.members}
+    guild_user_info = [[member.id, member.name] for member in guild.members]
     user_id = None
     user_id = await id_from_mention(name_or_mention)
     if user_id:
-        guild_user_ids = [i[0] for i in guild_user_info]
-        if user_id not in guild_user_ids:
+        if user_id not in members_by_id:
             return None # send error through ctx here or let the func that calls this do it?
     else:
         names = [i[1] for i in guild_user_info]
@@ -1532,13 +1585,14 @@ async def name_or_mention_to_id(db, ctx, name_or_mention):
                     user_id = i[0]
         else:
             return None
+    member = members_by_id.get(user_id)
+    if member is None:
+        return None
     try:
-        rows = await db.fetch("SELECT id FROM users WHERE id = $1", user_id)
-        if rows:
-            return user_id
-        else:
-            await db.execute("INSERT INTO users (id) values ($1)", user_id)
-            return user_id
+        result = await upsert_user(db, member)
+        if result is None:
+            await ctx.send("Ruh roh database error")
+        return result
     except asyncpg.exceptions.PostgresError as e:
         await ctx.send("Ruh roh database error")
         print(f"Database error: {e}")
@@ -1718,6 +1772,7 @@ class BotHelpCommand(commands.HelpCommand):
         
     detailed_help = {
         "add": "<movie title> — Adds a movienight suggestion. Ex. !add shrek 3",
+        "sync_names": "Owner only — Backfill guild/user display names from Discord into the DB for Nitwitch.",
         "remove": "<movie title> — Remove a suggestion. Ex. !remove shrek 3",
         "endorse": "<movie title> — Endorse a suggestion. Ex. !endorse shrek 3",
         "unendorse": "<movie title> Remove endorsement. Ex. !unendorse shrek 3",
@@ -1921,7 +1976,7 @@ async def setup_hook():
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (reconnected ok)")
+    print(f"Logged in as {bot.user} (reconnected ok) prefix={COMMAND_PREFIX!r}")
 
 
 bot.run(bot_token)
