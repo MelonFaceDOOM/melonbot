@@ -8,7 +8,7 @@ from discord.utils import get
 from discord import Intents
 from discord import File
 from matching import find_closest_match_and_score, rank_matches
-from config import bot_token, PSQL_CREDENTIALS, COMMAND_PREFIX
+from config import bot_token, PSQL_CREDENTIALS, COMMAND_PREFIX, admin_discord_ids
 from scraping.ebert import ebert_lookup
 import plotting
 from bot_narrate import NarrationCog
@@ -122,6 +122,28 @@ class Core(DbMixin, commands.Cog):
             print(f"Database error: {e}")
             return await ctx.send("Ruh roh database error")
         return await send_goodly(ctx, f"'{existing_movie['title']}' has been deleted.")
+
+    @commands.command()
+    async def admin_remove(self, ctx, *movie_title):
+        """<movie title> — Admin only. Remove a movie whether watched or unwatched."""
+        uid = await get_user_id(ctx, self.db)
+        if uid not in admin_discord_ids:
+            return await ctx.send("Only admins can force-remove movies.")
+        movie_title = " ".join(movie_title)
+        guild_id = await get_guild_id(ctx, self.db)
+        existing_movie = await find_exact_movie(self.db, guild_id, movie_title)
+        if not existing_movie:
+            return await ctx.send(f"'{movie_title}' doesn't exist.")
+        try:
+            await self.db.execute(
+                "DELETE FROM movies WHERE guild_id=$1 AND title=$2",
+                guild_id,
+                existing_movie['title'],
+            )
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error")
+        return await send_goodly(ctx, f"'{existing_movie['title']}' has been deleted.")
         
     async def _endorse_suggestion(self, ctx, guild_id, movie_title, endorser_user_id):
         """goes through full logic to determine if endorse can be done.
@@ -202,6 +224,37 @@ class Core(DbMixin, commands.Cog):
             print(f"Database error: {e}")
             return await ctx.send("Ruh roh database error")
         return await send_goodly(ctx, f"You have unendorsed '{existing_movie['title']}'.")
+
+    @commands.command()
+    async def admin_unendorse(self, ctx, movie_title, *name_or_mention):
+        """"<movie title>" <name or mention> — Admin only. Remove another user's endorsement."""
+        uid = await get_user_id(ctx, self.db)
+        if uid not in admin_discord_ids:
+            return await ctx.send("Only admins can remove another user's endorsement.")
+        name_or_mention = " ".join(name_or_mention)
+        target_user_id = await name_or_mention_to_id(self.db, ctx, name_or_mention)
+        if not target_user_id:
+            return await ctx.send(f"User '{name_or_mention}' not found")
+        username = await user_id_to_username(ctx, target_user_id)
+        if not username:
+            username = str(target_user_id)
+        guild_id = await get_guild_id(ctx, self.db)
+        existing_movie = await find_exact_movie(self.db, guild_id, movie_title)
+        if not existing_movie:
+            return await ctx.send(f"'{movie_title}' doesn't exist.")
+        if not await self._movie_is_endorsed_by_user(ctx, guild_id, existing_movie['title'], target_user_id):
+            return await ctx.send(f"'{username}' has not endorsed '{existing_movie['title']}'")
+        try:
+            await self.db.execute(
+                "DELETE FROM endorsements WHERE guild_id=$1 AND user_id=$2 AND movie_id=$3",
+                guild_id,
+                target_user_id,
+                existing_movie['id']
+            )
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error")
+        return await send_goodly(ctx, f"Removed '{username}'s endorsement from '{existing_movie['title']}'.")
                     
     @commands.command()
     async def rate(self, ctx, *movie_title_and_rating):
@@ -323,6 +376,65 @@ class Core(DbMixin, commands.Cog):
                 )
             else:
                 return await send_goodly(ctx, f"You have removed your rating from '{existing_movie['title']}'.")
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error")
+
+    @commands.command()
+    async def admin_unrate(self, ctx, movie_title, *name_or_mention):
+        """"<movie title>" <name or mention> — Admin only. Remove another user's rating."""
+        uid = await get_user_id(ctx, self.db)
+        if uid not in admin_discord_ids:
+            return await ctx.send("Only admins can remove another user's rating.")
+        name_or_mention = " ".join(name_or_mention)
+        target_user_id = await name_or_mention_to_id(self.db, ctx, name_or_mention)
+        if not target_user_id:
+            return await ctx.send(f"User '{name_or_mention}' not found")
+        username = await user_id_to_username(ctx, target_user_id)
+        if not username:
+            username = str(target_user_id)
+        guild_id = await get_guild_id(ctx, self.db)
+
+        existing_movie = await find_exact_movie(self.db, guild_id, movie_title)
+        if not existing_movie:
+            return await ctx.send(f"'{movie_title}' doesn't exist.")
+
+        try:
+            has_rating = await self.db.fetchval(
+                "SELECT 1 FROM ratings WHERE guild_id=$1 AND user_id=$2 AND movie_id=$3",
+                guild_id, target_user_id, existing_movie["id"]
+            )
+            if not has_rating:
+                return await ctx.send(f"'{username}' has not rated '{existing_movie['title']}'.")
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error")
+
+        try:
+            await self.db.execute(
+                "DELETE FROM ratings WHERE guild_id=$1 AND user_id=$2 AND movie_id=$3",
+                guild_id, target_user_id, existing_movie["id"]
+            )
+
+            any_left = await self.db.fetchval(
+                "SELECT 1 FROM ratings WHERE guild_id=$1 AND movie_id=$2 LIMIT 1",
+                guild_id, existing_movie["id"]
+            )
+
+            if not any_left:
+                await self.db.execute(
+                    "UPDATE movies SET watched=$1, date_watched=$2 WHERE guild_id=$3 AND id=$4",
+                    0, None, guild_id, existing_movie["id"]
+                )
+                return await send_goodly(
+                    ctx,
+                    f"Removed the last rating (from '{username}') on '{existing_movie['title']}' and so it has been returned to suggestions."
+                )
+            else:
+                return await send_goodly(
+                    ctx,
+                    f"Removed '{username}'s rating from '{existing_movie['title']}'."
+                )
         except asyncpg.exceptions.PostgresError as e:
             print(f"Database error: {e}")
             return await ctx.send("Ruh roh database error")
@@ -1729,10 +1841,13 @@ class BotHelpCommand(commands.HelpCommand):
             "Core": [
                 "add",
                 "remove",
+                "admin_remove",
                 "endorse",
                 "unendorse",
+                "admin_unendorse",
                 "rate",
                 "unrate",
+                "admin_unrate",
                 "review",
                 "transfer",
                 "find",
@@ -1774,10 +1889,13 @@ class BotHelpCommand(commands.HelpCommand):
         "add": "<movie title> — Adds a movienight suggestion. Ex. !add shrek 3",
         "sync_names": "Owner only — Backfill guild/user display names from Discord into the DB for Nitwitch.",
         "remove": "<movie title> — Remove a suggestion. Ex. !remove shrek 3",
+        "admin_remove": "<movie title> — Admin only. Remove a movie whether watched or unwatched. Ex. !admin_remove shrek 3",
         "endorse": "<movie title> — Endorse a suggestion. Ex. !endorse shrek 3",
         "unendorse": "<movie title> Remove endorsement. Ex. !unendorse shrek 3",
+        "admin_unendorse": '"<movie title>" <name or mention> — Admin only. Remove another user\'s endorsement. Ex. !admin_unendorse "shrek 3" @user',
         "rate": "<movie title> <1-10> — Rate a movie. Ex. !rate shrek 3 10",
         "unrate": "<movie title> — Remove rating. Ex. !unrate shrek 3",
+        "admin_unrate": '"<movie title>" <name or mention> — Admin only. Remove another user\'s rating. Ex. !admin_unrate "shrek 3" @user',
         "review": '"<movie title>" <review text> — Review a movie. If the movie is more than 1 word, put quotes around it. Ex. !review "shrek 3" this was a super great amazing movie!!!',
         "transfer":'"<movie title>" <name or mention> — Transfer movie choosership to a new person. If the movie is more than 1 word, put quotes around it. Ex. !transfer "shrek 3" some discord user. You can also use @discord_user',
         "find": '<search text> <[n,p]> — Search for users or movies. Ex. !find discord user; !find movie title. Browse through results by adding a paginator. Ex. !find movie title [10,2] -> return the 2nd page; 10 results per page.',
