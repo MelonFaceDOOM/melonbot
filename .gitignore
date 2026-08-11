@@ -8,5 +8,8 @@ venv/
 data/streams/
 # Bot-generated audio
 data/audio/
+# Message archive operator status (stealth feature)
+data/message_archive_status.json
+data/message_archive/
 *.ogg
 log.txt

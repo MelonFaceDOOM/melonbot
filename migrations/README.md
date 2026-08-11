@@ -91,3 +91,41 @@ ORDER BY table_name, column_name;
 6. Confirm Nitwitch prod `MOVIENIGHT_DB_*` shows names.
 
 **Rollback:** columns are nullable and additive. Do not drop them while Nitwitch models still SELECT them.
+
+---
+
+## Message archive (`migration_2026_08_10_message_archive.py`)
+
+Adds schema `message_archive` (channels, messages, attachments, reactions) for stealth Discord history archival. No Discord commands — enable via env (`MESSAGE_ARCHIVE_ENABLED`, `MESSAGE_ARCHIVE_GUILD_IDS`); progress is `data/message_archive_status.json`.
+
+### Migrate runbook: first dev, then prod
+
+#### A. Dev
+
+1. `.env`: `MELONBOT_DB=dev` (tunnel on if needed).
+2. Run:
+
+```text
+python migrations/migration_2026_08_10_message_archive.py
+```
+
+3. Verify:
+
+```sql
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'message_archive'
+ORDER BY table_name;
+```
+
+4. Set `MESSAGE_ARCHIVE_ENABLED=1` and `MESSAGE_ARCHIVE_GUILD_IDS=<test_guild_id>`, restart the **dev** bot.
+5. Confirm `data/message_archive_status.json` updates and rows appear in `message_archive.messages`.
+
+#### B. Prod
+
+1. Deploy melonbot code that includes the archive cog.
+2. Run the same migration with `MELONBOT_DB=prod`.
+3. Set allowlist + enable on the prod host; restart the **prod** bot.
+4. Watch the status JSON / SQL counts — nothing is announced in Discord.
+
+**Rollback:** drop schema `message_archive` only if you are sure nothing depends on it (`DROP SCHEMA message_archive CASCADE`).

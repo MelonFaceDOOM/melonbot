@@ -131,3 +131,29 @@ twitch_refresh_token = os.environ.get("TWITCH_REFRESH_TOKEN", "")
 STREAMLINK_BIN = os.environ.get(
     "STREAMLINK_BIN", "D:/code/melonbot/venv/Scripts/streamlink.exe"
 )
+
+# ---------------------------------------------------------------------------
+# Message archive (stealth; no Discord commands)
+# ---------------------------------------------------------------------------
+MESSAGE_ARCHIVE_ENABLED = _flag("MESSAGE_ARCHIVE_ENABLED")
+
+
+def _parse_guild_ids(raw: str) -> frozenset[int]:
+    ids: set[int] = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            print(f"warning: ignoring invalid MESSAGE_ARCHIVE_GUILD_IDS entry {part!r}", flush=True)
+    return frozenset(ids)
+
+
+MESSAGE_ARCHIVE_GUILD_IDS = _parse_guild_ids(
+    os.environ.get("MESSAGE_ARCHIVE_GUILD_IDS", "")
+)
+MESSAGE_ARCHIVE_STATUS_PATH = os.environ.get(
+    "MESSAGE_ARCHIVE_STATUS_PATH", "data/message_archive_status.json"
+).strip() or "data/message_archive_status.json"

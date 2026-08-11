@@ -8,16 +8,19 @@ from discord.utils import get
 from discord import Intents
 from discord import File
 from matching import find_closest_match_and_score, rank_matches
-from config import bot_token, PSQL_CREDENTIALS, COMMAND_PREFIX, admin_discord_ids
+from config import (
+    bot_token,
+    PSQL_CREDENTIALS,
+    COMMAND_PREFIX,
+    admin_discord_ids,
+    MESSAGE_ARCHIVE_ENABLED,
+)
 from scraping.ebert import ebert_lookup
 import plotting
 from bot_narrate import NarrationCog
 from bot_helpers import get_user_id, get_guild_id, send_goodly, upsert_guild, upsert_user
 from bot_stream_tracker import StreamTrackerCog
-from make_melonbot_db import make_db
 from db_mixin import DbMixin
-
-make_db() # update db tables. creates & closes its own conn
 
 class Core(DbMixin, commands.Cog):
     def __init__(self, bot):
@@ -2054,6 +2057,7 @@ intents = Intents.default()
 intents.members = True
 intents.message_content = True
 intents.voice_states = True
+intents.reactions = True
 
 
 # ----------------------------
@@ -2088,6 +2092,11 @@ async def setup_hook():
     await bot.add_cog(Plotting(bot))
     await bot.add_cog(NarrationCog(bot))
     await bot.add_cog(StreamTrackerCog(bot))
+    if MESSAGE_ARCHIVE_ENABLED:
+        from bot_message_archive import MessageArchiveCog
+
+        await bot.add_cog(MessageArchiveCog(bot))
+        print("message archive cog enabled")
 
     print("cogs added")
 
