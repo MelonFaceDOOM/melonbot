@@ -292,21 +292,26 @@ class GuildVoiceSession():
         self.player_task: Optional[asyncio.Task] = None
         self.idle_task: Optional[asyncio.Task] = None
         self.lock = asyncio.Lock()
-        self.last_activity = time.time()
+        self.last_activity = time.monotonic()
 
     # ---------- enqueue ----------
     async def enqueue(self, audio_bytes: bytes):
         await self.queue.put(audio_bytes)
-        self.last_activity = time.time()
+        self.last_activity = time.monotonic()
 
     # ---------- connection & lifecycle ----------
     async def ensure_connected(self, channel: discord.VoiceChannel) -> None:
         async with self.lock:
+            # Sessions survive disconnects and can exist long before the first join.
+            # Claiming a channel is activity, even if no narration follows it.
+            self.last_activity = time.monotonic()
             if self.voice_client and self.voice_client.is_connected():
                 if self.voice_client.channel.id != channel.id:
                     await self.voice_client.move_to(channel)
             else:
                 self.voice_client = await channel.connect(reconnect=True, self_deaf=True)
+            # Give the connection a full idle interval after the handshake/move.
+            self.last_activity = time.monotonic()
             self._ensure_player()
             self._ensure_idle_timer()
             
@@ -323,7 +328,7 @@ class GuildVoiceSession():
                 self.queue.task_done()
         except asyncio.QueueEmpty:
             pass
-        self.last_activity = time.time()
+        self.last_activity = time.monotonic()
 
     def _ensure_player(self):
         if self.player_task and not self.player_task.done():
@@ -344,12 +349,12 @@ class GuildVoiceSession():
                         await self._play_one(audio_bytes)
                     finally:
                         self.queue.task_done()
-                    self.last_activity = time.time()
+                    self.last_activity = time.monotonic()
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     print(f"[narrate] player error: {e}")
-                    self.last_activity = time.time()
+                    self.last_activity = time.monotonic()
         except asyncio.CancelledError:
             return
             
@@ -415,12 +420,13 @@ class GuildVoiceSession():
         try:
             while True:
                 await asyncio.sleep(5)
-                now = time.time()
+                now = time.monotonic()
                 if (now - self.last_activity) <= PLAYBACK_IDLE_DISCONNECT_SECS:
                     # If not connected, nothing to do—exit quietly
                     if not self.voice_client or not self.voice_client.is_connected():
                         return
                     continue
+                print(f"[narrate] idle disconnect: guild={self.guild_id}, idle={now - self.last_activity:.0f}s")
                 await self.teardown()
                 return
         except asyncio.CancelledError:

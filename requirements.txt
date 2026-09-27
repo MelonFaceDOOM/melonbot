@@ -17,8 +17,7 @@ ctranslate2==4.6.0
 cycler==0.12.1
 decorator==4.4.2
 defusedxml==0.7.1
-discord==2.3.2
-discord.py==2.6.3
+discord.py[voice]==2.7.1
 faster-whisper==1.1.1
 feedparser==6.0.11
 ffmpy==0.3.2
@@ -108,4 +107,3 @@ urllib3==2.3.0
 websocket-client==1.8.0
 yarl==1.18.3
 zeroconf==0.132.2
-discord.py[voice]
