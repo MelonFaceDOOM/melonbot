@@ -52,6 +52,7 @@ DESIGN_VIEW_TIMEOUT = 600
 FISH_LIBRARY_URL = "https://fish.audio/voice-library/"
 GEMINI_VOICES_URL = "https://cloud.google.com/text-to-speech/docs/gemini-tts"
 GOOGLE_VOICES_URL = "https://cloud.google.com/text-to-speech/docs/voices"
+VOICES_EMBED_COLOR = 0x77C66E  # melon green
 
 # fallback_reason -> (notice, cooldown seconds; None = once per month)
 FALLBACK_NOTICES = {
@@ -565,6 +566,14 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         except Exception:
             asyncio.create_task(_cleanup())
 
+    async def aclose(self):
+        """Called by BottyBoy.close() on shutdown: stop workers and close the TTS HTTP sessions."""
+        for t in list(self._guild_workers.values()):
+            t.cancel()
+        await asyncio.gather(*self._guild_workers.values(), return_exceptions=True)
+        self._guild_workers.clear()
+        await self.router.close()
+
     def _enqueue_narration(self, guild_id: int, item: tuple) -> bool:
         q = self._guild_queues.get(guild_id)
         if q is None:
@@ -1077,7 +1086,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "Tip: start a message with [whispering] / [excited] / [very sad] etc. to set how it's read,\n"
             "and use [laugh] [sigh] [gasp] [pause] anywhere (Fish & Gemini voices only)."
         )
-        await ctx.send(usage, suppress_embeds=True)
+        # Show the prefix this bot actually uses (dev runs with '?')
+        await ctx.send(usage.replace("!narrate", f"{ctx.clean_prefix}narrate"), suppress_embeds=True)
 
     @narrate_root.command(name="on", aliases=["start"])
     async def narrate_on(self, ctx: commands.Context):
@@ -1108,30 +1118,64 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         await session.cancel_playback()  # also drops messages still waiting to be synthesized
         await ctx.send("⏹️ Stopped current narration.")
 
+    async def _voices_embed(self, ctx: commands.Context) -> discord.Embed:
+        """Provider guide for `!narrate voices`: what each is good at, where to browse, how to pick one."""
+        p = f"{ctx.clean_prefix}narrate"
+        try:
+            pref = await self._get_pref(ctx.guild.id, ctx.author.id)
+        except Exception:
+            pref = None
+        current = _voice_display((pref or {}).get("voice") or DEFAULT_VOICE, (pref or {}).get("voice_label"))
+        embed = discord.Embed(
+            title="🎙️ Narration voices",
+            description=f"Your voice: **{discord.utils.escape_markdown(current)}**\nChange it with `{p} voice …`",
+            color=VOICES_EMBED_COLOR,
+        )
+        if self.fish:
+            embed.add_field(
+                name="🐟 Fish Audio · default",
+                value=(f"⚡ **Fast** (~1–2 s) · 🎭 expressive · 📚 huge community library: characters, accents, memes\n"
+                       f"[Browse voices]({FISH_LIBRARY_URL}), open one, copy its link\n"
+                       f"`{p} voice <link>`"),
+                inline=False,
+            )
+        if self.gemini:
+            embed.add_field(
+                name="✨ Gemini",
+                value=(f"🎯 **Best at following `[style]` hints** · 🐢 slower (~3–5 s) · 200+ voices\n"
+                       f"[Voice list]({GEMINI_VOICES_URL})\n"
+                       f"`{p} voice gemini:Kore`"),
+                inline=False,
+            )
+        embed.add_field(
+            name="🔊 Google",
+            value=(f"🆓 **Free** · ⚡ fastest (<1 s) · 😐 no emotion, ignores hints · stands in when the budget runs out\n"
+                   f"[Voice list]({GOOGLE_VOICES_URL})\n"
+                   f"`{p} voice en-US-Wavenet-D`, or `{p} voices en-US female` for short names"),
+            inline=False,
+        )
+        if self.fish:
+            embed.add_field(
+                name="🎨 Make your own",
+                value=f"`{p} design raspy old pirate, slow and amused`, then pick from 3 takes",
+                inline=False,
+            )
+        if self.fish or self.gemini:
+            embed.add_field(
+                name="💬 Hints (Fish & Gemini)",
+                value=(f"Start a message with `[whispering]`, `[excited]`, `[very sad]`…\n"
+                       f"Drop `[laugh]` `[sigh]` `[pause]` anywhere\n"
+                       f"`{p} style dry and sarcastic` sets a default"),
+                inline=False,
+            )
+            embed.set_footer(text="Fish and Gemini share a monthly budget; past it, Google takes over until next month.")
+        return embed
+
     @narrate_root.command(name="voices")
     async def narrate_voices(self, ctx: commands.Context, language: Optional[str] = None, gender: Optional[str] = None):
-        url = GOOGLE_VOICES_URL
-
         # No args: where to browse each provider's voices
         if not language:
-            parts = ["**Where to find voices**"]
-            if self.fish:
-                parts.append(
-                    f"**Fish Audio** (expressive, huge community library): <{FISH_LIBRARY_URL}>\n"
-                    f"  Open a voice, copy its link, then `!narrate voice <link>`"
-                )
-            if self.gemini:
-                parts.append(
-                    f"**Gemini** (best at following [style] hints): <{GEMINI_VOICES_URL}>\n"
-                    f"  `!narrate voice gemini:<name>` e.g. `!narrate voice gemini:Kore`"
-                )
-            parts.append(
-                f"**Google** (free, no emotion): <{url}>\n"
-                f"  `!narrate voice <full voice name>` or `!narrate voices <language> [male/female]` for short names"
-            )
-            if self.fish:
-                parts.append("Or invent one: `!narrate design <description>`")
-            return await ctx.send("\n".join(parts), suppress_embeds=True)
+            return await ctx.send(embed=await self._voices_embed(ctx))
 
         # With filters
         lang_in = _collapse_ws(language)
@@ -1237,7 +1281,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 low[len("fish:"):], ctx.guild.id,
             )
             if not row:
-                return await ctx.send("No designed voice with that id. `!narrate designs` lists yours.", suppress_embeds=True)
+                return await ctx.send(f"No designed voice with that id. `{ctx.clean_prefix}narrate designs` lists yours.", suppress_embeds=True)
             return await self._apply_voice(ctx, low, row["title"], "Fish Audio, designed")
 
         # Fish: fish:<id>, a fish.audio link, or a bare 32-hex model id
@@ -1293,7 +1337,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 except Exception as e:
                     print(f"[narrate] gemini voice lookup failed: {e}")
             return await ctx.send(
-                "Unknown voice. `!narrate voices` shows where to find Fish, Gemini and Google voices.",
+                f"Unknown voice. `{ctx.clean_prefix}narrate voices` shows where to find Fish, Gemini and Google voices.",
                 suppress_embeds=True,
             )
 
@@ -1377,7 +1421,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             return await ctx.send("Voice design needs Fish Audio, which isn't set up on this bot.", suppress_embeds=True)
         description = _collapse_ws(description)
         if len(description) < 5:
-            return await ctx.send("Describe the voice, e.g. `!narrate design raspy old pirate, slow and amused`.",
+            return await ctx.send(f"Describe the voice, e.g. `{ctx.clean_prefix}narrate design raspy old pirate, slow and amused`.",
                                   suppress_embeds=True)
         now = time.monotonic()
         last = self._design_last_used.get(ctx.author.id)
@@ -1497,9 +1541,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             ctx.guild.id, ctx.author.id,
         )
         if not rows:
-            return await ctx.send("You haven't designed any voices yet. Try `!narrate design <description>`.",
+            return await ctx.send(f"You haven't designed any voices yet. Try `{ctx.clean_prefix}narrate design <description>`.",
                                   suppress_embeds=True)
-        lines = ["Your designed voices (use with `!narrate voice fish:<id>`):"]
+        lines = [f"Your designed voices (use with `{ctx.clean_prefix}narrate voice fish:<id>`):"]
         for r in rows:
             lines.append(f"- **{r['title']}**: `fish:{r['voice_id']}`")
         await ctx.send("\n".join(lines)[:1900], suppress_embeds=True)

@@ -176,6 +176,24 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item[2], bot_narrate.DEFAULT_GOOGLE_VOICE)
         self.cog._notify_fallback.assert_awaited_once()
 
+    async def test_voices_embed(self):
+        self.cog.fish, self.cog.gemini = Mock(), Mock()
+        self.cog._get_pref.return_value = {"voice": "fish:" + "a" * 32, "voice_label": "Guyzo"}
+        ctx = Mock(clean_prefix="?")
+        embed = await self.cog._voices_embed(ctx)
+        self.assertIn("Guyzo (Fish)", embed.description)
+        names = [f.name for f in embed.fields]
+        self.assertEqual(len(names), 5)
+        self.assertTrue(all("?narrate" in f.value for f in embed.fields))
+        self.assertFalse(any("!narrate" in f.value for f in embed.fields))
+        self.assertTrue(all(len(f.value) <= 1024 for f in embed.fields))  # Discord field limit
+        self.assertLess(len(embed), 6000)                                  # Discord embed limit
+
+    async def test_voices_embed_without_paid_providers(self):
+        ctx = Mock(clean_prefix="!")
+        embed = await self.cog._voices_embed(ctx)
+        self.assertEqual([f.name for f in embed.fields], ["🔊 Google"])
+
     async def test_own_voice_recycle_is_not_treated_as_a_kick(self):
         self.cog._set_all_prefs_disabled = AsyncMock()
         self.session.teardown = AsyncMock()
