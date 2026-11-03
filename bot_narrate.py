@@ -20,7 +20,7 @@ from tts_providers import (
     BudgetTracker, FishTTSProvider, GeminiTTSProvider, GoogleTTSProvider, LRUCache, TTSRouter,
     DEFAULT_GOOGLE_VOICE, DEFAULT_LANG, DEFAULT_RATE, FISH_REF_PREFIX, FISH_VOICE_DESIGN_USD, ProviderError,
     GEMINI_MODEL_ALIASES, GEMINI_MODEL_LABELS, audio_format, extract_fish_id, parse_voice_ref,
-    resolve_gemini_model,
+    resolve_gemini_model, split_gemini_voice,
 )
 from tts_text import chunk_for_speech, split_leading_style
 import re
@@ -530,8 +530,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                        if gemini_api_key else None)
         self.budget = BudgetTracker(lambda: self.db, TTS_MONTHLY_BUDGET_USD)
         self.router = TTSRouter(self.tts, self.fish, self.gemini, self.budget,
-                                reference_loader=self._load_designed_sample,
-                                fish_standin_voice=DEFAULT_VOICE[len("fish:"):] if DEFAULT_VOICE.startswith("fish:") else None)
+                                reference_loader=self._load_designed_sample)
+        # (guild_id, user_id, voice ref) -> (monotonic time, [(fallback ref, label)]) for Gemini users
+        self._fallback_cache: Dict[Tuple[int, int, str], Tuple[float, List[Tuple[str, Optional[str]]]]] = {}
         self.guild_sessions: Dict[int, GuildVoiceSession] = {}
         # One queue + worker per guild, so a busy guild can't hold up the others.
         # Items: (user_id, text, voice ref, style, rate, channel_id, session generation)
@@ -1960,6 +1961,79 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
         await ctx.send(f"Deleted voiceline `{name}`.", suppress_embeds=True)
 
+    async def _gemini_fallbacks(self, guild_id: int, user_id: int, voice_ref: str) -> List[Tuple[str, Optional[str]]]:
+        """
+        Voices to use when a Gemini voice can't speak, in order:
+          1. the user's most recent non-Gemini voice (their history)
+          2. Google's free Chirp3-HD version of the same voice name (the 30 standard Gemini voices have one)
+          3. a free Chirp3-HD voice picked from the user id, so it's always the same one for them
+        """
+        key = (guild_id, user_id, voice_ref)
+        cached = self._fallback_cache.get(key)
+        if cached and time.monotonic() - cached[0] < 600:
+            return cached[1]
+        refs: List[Tuple[str, Optional[str]]] = []
+        try:
+            row = await self.db.fetchrow(
+                """
+                SELECT voice, voice_label FROM narrate_voice_history
+                WHERE guild_id=$1 AND user_id=$2 AND voice NOT LIKE 'gemini:%'
+                ORDER BY set_at DESC, id DESC LIMIT 1
+                """,
+                guild_id, user_id,
+            )
+            if row:
+                refs.append((row["voice"], row["voice_label"]))
+            name = split_gemini_voice(parse_voice_ref(voice_ref)[1])[0]
+            same = await self.db.fetchrow(
+                "SELECT voice_name, nickname FROM google_tts_voices WHERE lower(voice_name) = lower($1)",
+                f"en-US-Chirp3-HD-{name}",
+            )
+            if same:
+                refs.append((same["voice_name"], same["nickname"]))
+            else:
+                pool = await self.db.fetch(
+                    "SELECT voice_name, nickname FROM google_tts_voices "
+                    "WHERE voice_name LIKE 'en-US-Chirp3-HD-%' ORDER BY voice_name")
+                if pool:
+                    pick = pool[user_id % len(pool)]
+                    refs.append((pick["voice_name"], pick["nickname"]))
+        except Exception as e:
+            print(f"[narrate] couldn't work out fallback voices: {e}")
+        self._fallback_cache[key] = (time.monotonic(), refs)
+        return refs
+
+    async def _switch_off_gemini(self, guild: discord.Guild, user_id: int, channel_id: int,
+                                 old_ref: str, new_ref: str, label: Optional[str]) -> None:
+        """Save the stand-in as the user's voice and tell them how to switch back."""
+        try:
+            await self.db.execute(
+                """
+                UPDATE narrate_prefs SET voice=$3, voice_label=$4, updated_at=CURRENT_TIMESTAMP
+                WHERE guild_id=$1 AND user_id=$2 AND voice=$5
+                """,
+                guild.id, user_id, new_ref, label, old_ref,
+            )
+            await self._record_voice_history(guild.id, user_id, new_ref, label)
+        except Exception as e:
+            print(f"[narrate] failed to save the switch off Gemini: {e}")
+            return
+        self._fallback_cache = {k: v for k, v in self._fallback_cache.items() if k[:2] != (guild.id, user_id)}
+        member = guild.get_member(user_id)
+        who = discord.utils.escape_markdown(member.display_name) if member else "Someone"
+        prefix = self.bot.command_prefix if isinstance(self.bot.command_prefix, str) else "!"
+        ch = guild.get_channel(channel_id)
+        if ch:
+            try:
+                await ch.send(
+                    f"Gemini voices are out of quota for now, so **{who}** now uses "
+                    f"**{discord.utils.escape_markdown(_voice_display(new_ref, label))}**. "
+                    f"Switch back later with `{prefix}narrate voice {old_ref}`.",
+                    suppress_embeds=True,
+                )
+            except Exception:
+                pass
+
     async def _may_edit_voiceline(self, ctx: commands.Context, guild_id: int, user_id: int, name: str) -> bool:
         """Creator or manage_guild. Unknown names return True so the command reports 'not found'."""
         if ctx.author.guild_permissions.manage_guild:
@@ -2064,8 +2138,20 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             for part in chunks:
                 if session.generation != gen:
                     return  # cancelled mid-message: don't pay for the rest
-                res = await self.router.synth(voice, part, style=style, rate=rate)
-                if res.fallback_reason:
+                is_gemini = parse_voice_ref(voice)[0] == "gemini"
+                fallbacks = await self._gemini_fallbacks(guild_id, user_id, voice) if is_gemini else []
+                res = await self.router.synth(voice, part, style=style, rate=rate,
+                                              fallback_refs=[ref for ref, _ in fallbacks])
+                print(f"[narrate] guild={guild_id} user={user_id} voice={voice} -> "
+                      f"{res.voice_ref_used or voice} via {res.provider}/{res.model or '-'}"
+                      + (f" (fallback: {res.fallback_reason})" if res.fallback_reason else ""))
+                if is_gemini and res.fallback_reason == "gemini_limit" and res.voice_ref_used:
+                    # Every Gemini model is out: make the stand-in their voice so it stays put instead of
+                    # flipping back and forth as quota comes and goes. One notice explains how to go back.
+                    label = dict(fallbacks).get(res.voice_ref_used)
+                    await self._switch_off_gemini(guild, user_id, channel_id, voice, res.voice_ref_used, label)
+                    voice = res.voice_ref_used
+                elif res.fallback_reason:
                     await self._notify_fallback(guild, channel_id, res.fallback_reason)
                 if session.generation != gen:
                     return

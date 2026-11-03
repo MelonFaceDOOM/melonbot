@@ -12,6 +12,7 @@ over budget, rate limited, misconfigured, or erroring.
 """
 import asyncio
 import base64
+import zlib
 import io
 import json
 import re
@@ -19,7 +20,7 @@ import time
 import wave
 from dataclasses import dataclass
 from datetime import date
-from typing import Awaitable, Callable, Dict, Hashable, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
 
 import aiohttp
 
@@ -67,6 +68,9 @@ GEMINI_PCM_RATE = 24000  # older models return headerless 16-bit mono PCM at thi
 # Only these accept the speech_metadata style annotation; older models reject it ("Speech annotations are
 # not supported") and instead take the style as a spoken direction in front of the text, which they don't read aloud.
 GEMINI_ANNOTATION_MODELS = frozenset({"gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"})
+# Switching models changes how a voice sounds, so stay put through short waits:
+GEMINI_STICKY_WAIT_SECS = 8.0     # wait this long for the current model's per-minute slot before trying another
+GEMINI_SHORT_RETRY_SECS = 10.0    # a 429 asking to retry within this long is waited out on the same model
 # A 400 that means "this model can't take a style" (vs. a bad voice etc.): retry the same model without it
 _STYLE_REJECTED_RE = re.compile(
     r"(annotation|metadata|style|prompt)\w*\W+(?:\w+\W+){0,4}not supported|not supported\W+(?:\w+\W+){0,4}"
@@ -478,19 +482,27 @@ class GeminiTTSProvider(_HttpProvider):
         limited = len(available) < len(order)
         last_error: Optional[Exception] = None
         for i, model in enumerate(available):
-            # Don't queue behind one model's per-minute limit while another model has room;
-            # only the last option is worth waiting a few seconds for.
-            if not await self._limiters[model].acquire(max_wait if i == len(available) - 1 else 0):
+            # Stay on the first usable model through a short per-minute wait (switching models is audible);
+            # later models only get the caller's max_wait on the last option.
+            wait_for = max(max_wait, GEMINI_STICKY_WAIT_SECS) if i == 0 else (max_wait if i == len(available) - 1 else 0)
+            if not await self._limiters[model].acquire(wait_for):
                 limited = True
                 last_error = RateLimited("gemini", None, f"{model}: client-side rate limit")
                 continue
             # A style the model can't take is dropped (same model, same voice) rather than switching models
             styles = [style, None] if style and model not in self._no_style_models else [None]
-            for attempt_style in styles:
+            si, waited_out = 0, False
+            while si < len(styles):
+                attempt_style = styles[si]
                 try:
                     return await self._synth_one(model, text, voice, attempt_style), model
                 except RateLimited as e:
                     wait = retry_after_secs(str(e)) or 60.0
+                    if wait <= GEMINI_SHORT_RETRY_SECS and not waited_out:
+                        waited_out = True
+                        print(f"[tts] gemini {model} asked to wait {wait:.0f}s; waiting rather than switching")
+                        await asyncio.sleep(wait + 0.25)
+                        continue
                     self._blocked_until[model] = time.monotonic() + wait
                     print(f"[tts] gemini {model} limited for {wait / 3600:.1f}h; trying next model")
                     limited = True
@@ -501,6 +513,7 @@ class GeminiTTSProvider(_HttpProvider):
                     if attempt_style and e.status == 400 and _STYLE_REJECTED_RE.search(str(e)):
                         print(f"[tts] gemini {model} rejected the style; retrying without it")
                         self._no_style_models.add(model)
+                        si += 1
                         continue
                     # e.g. a voice an older model doesn't have; another model may still work
                     print(f"[tts] gemini {model} failed ({e.status}): {str(e)[:200]}; trying next model")
@@ -508,6 +521,12 @@ class GeminiTTSProvider(_HttpProvider):
         if limited and not isinstance(last_error, RateLimited):
             raise RateLimited("gemini", 429, f"Gemini models out of quota (last error: {last_error})")
         raise last_error or RateLimited("gemini", 429, "no Gemini model available")
+
+    @staticmethod
+    def voice_seed(voice: str) -> int:
+        """Fixed sampling seed per voice: the same voice always samples the same way, which steadies how it
+        sounds from message to message (identical text then comes out identical)."""
+        return zlib.crc32(voice.lower().encode()) % 2_147_483_647
 
     @staticmethod
     def build_body(model: str, text: str, voice: str, style: Optional[str]) -> dict:
@@ -520,7 +539,7 @@ class GeminiTTSProvider(_HttpProvider):
             "model": model,
             "input": [{"type": "user_input", "content": [content]}],
             "response_format": {"type": "audio"},
-            "generation_config": {"speech_config": [{"voice": voice}]},
+            "generation_config": {"speech_config": [{"voice": voice}], "seed": GeminiTTSProvider.voice_seed(voice)},
         }
 
     async def _synth_one(self, model: str, text: str, voice: str, style: Optional[str]) -> bytes:
@@ -688,6 +707,8 @@ class SynthResult:
     provider: str                    # provider that actually produced the audio
     fallback_reason: Optional[str]   # None, or why a paid voice fell back to Google
     cost_usd: float = 0.0            # estimated spend for this request (0 for Google and cache hits)
+    voice_ref_used: Optional[str] = None  # the voice that actually spoke (differs from the request on fallback)
+    model: Optional[str] = None           # provider model that produced it (for logs)
 
 
 def parse_voice_ref(ref: Optional[str]) -> Tuple[str, str]:
@@ -718,13 +739,10 @@ class TTSRouter:
 
     def __init__(self, google: GoogleTTSProvider, fish: Optional[FishTTSProvider],
                  gemini: Optional[GeminiTTSProvider], budget: BudgetTracker,
-                 reference_loader: Optional[Callable[[str], Awaitable[Optional[Tuple[bytes, str]]]]] = None,
-                 fish_standin_voice: Optional[str] = None):
+                 reference_loader: Optional[Callable[[str], Awaitable[Optional[Tuple[bytes, str]]]]] = None):
         self.google = google
         self.fish = fish
         self.gemini = gemini
-        # Fish voice used when every Gemini model is out of quota (closer to Gemini than Google is)
-        self.fish_standin_voice = fish_standin_voice
         self.budget = budget
         self._cache = LRUCache(CACHE_MAX_ITEMS, max_bytes=64 * 1024 * 1024)
         # Unsaved Fish voices ('fish:ref:<key>') are spoken from a stored sample; loader returns (audio, transcript)
@@ -753,7 +771,12 @@ class TTSRouter:
         return self.CHUNK_PLAN[parse_voice_ref(voice_ref)[0]]
 
     async def synth(self, voice_ref: Optional[str], text: str, style: Optional[str] = None,
-                    rate: float = DEFAULT_RATE) -> SynthResult:
+                    rate: float = DEFAULT_RATE, fallback_refs: Sequence[str] = ()) -> SynthResult:
+        """
+        Speak with voice_ref. If a paid voice can't (budget, quota, error), try fallback_refs in order
+        (Fish or Google refs; Gemini refs are skipped), then DEFAULT_GOOGLE_VOICE.
+        SynthResult.voice_ref_used says which voice actually spoke.
+        """
         provider, voice_id = parse_voice_ref(voice_ref)
         reason = None
         if provider != "google":
@@ -764,21 +787,20 @@ class TTSRouter:
                 reason = "budget"
             else:
                 try:
-                    return await self._synth_paid(provider, client, voice_id, text, style, rate)
+                    res = await self._synth_paid(provider, client, voice_id, text, style, rate)
+                    res.voice_ref_used = voice_ref
+                    return res
                 except RateLimited as e:
                     print(f"[tts] {provider} rate limited: {e}")
                     reason = "gemini_limit" if provider == "gemini" else "rate_limited"
                 except Exception as e:
                     print(f"[tts] {provider} synth failed: {e}")
                     reason = "balance" if getattr(e, "status", None) == 402 else "error"
-                # A Fish voice is a much closer stand-in for Gemini than Google is
-                if provider == "gemini" and self.fish and self.fish_standin_voice:
-                    try:
-                        res = await self._synth_paid("fish", self.fish, self.fish_standin_voice, text, style, rate)
-                        res.fallback_reason = reason
-                        return res
-                    except Exception as e2:
-                        print(f"[tts] fish stand-in for gemini failed: {e2}")
+            for ref in fallback_refs:
+                res = await self._try_fallback(ref, text, style, rate)
+                if res:
+                    res.fallback_reason, res.voice_ref_used = reason, ref
+                    return res
             voice_id = DEFAULT_GOOGLE_VOICE
 
         prepared, _ = tts_text.prepare(text, "google")
@@ -786,7 +808,25 @@ class TTSRouter:
             raise ValueError("nothing to say after removing tags")
         audio = await self.google.synth(prepared, voice_name=voice_id,
                                         language_code=google_language(voice_id), speaking_rate=rate)
-        return SynthResult(audio, "ogg_opus", "google", reason)
+        return SynthResult(audio, "ogg_opus", "google", reason, voice_ref_used=voice_id)
+
+    async def _try_fallback(self, ref: str, text: str, style: Optional[str], rate: float) -> Optional[SynthResult]:
+        provider, voice_id = parse_voice_ref(ref)
+        try:
+            if provider == "fish":
+                if not self.fish or await self.budget.exhausted():
+                    return None
+                return await self._synth_paid("fish", self.fish, voice_id, text, style, rate)
+            if provider == "google":
+                prepared, _ = tts_text.prepare(text, "google")
+                if not prepared:
+                    return None
+                audio = await self.google.synth(prepared, voice_name=voice_id,
+                                                language_code=google_language(voice_id), speaking_rate=rate)
+                return SynthResult(audio, "ogg_opus", "google", None)
+        except Exception as e:
+            print(f"[tts] fallback voice {ref} failed: {e}")
+        return None
 
     async def _synth_paid(self, provider, client, voice_id, text, style, rate) -> SynthResult:
         prepared, sep_style = tts_text.prepare(text, provider, style)
@@ -795,7 +835,7 @@ class TTSRouter:
         key = (provider, voice_id, prepared, sep_style, round(float(rate), 2))
         cached = self._cache.get(key)
         if cached is not None:
-            return SynthResult(cached, audio_format(cached), provider, None)
+            return SynthResult(cached, audio_format(cached), provider, None, model="cache")
 
         if provider == "fish":
             if voice_id.startswith(FISH_REF_PREFIX):
@@ -804,6 +844,7 @@ class TTSRouter:
             else:
                 audio = await client.synth(prepared, voice_id, speed=rate)
             cost = fish_cost(prepared, client.model)
+            model = client.model
             await self.budget.record("fish", cost, chars=len(prepared))
         else:
             voice, prefer = split_gemini_voice(voice_id)
@@ -816,4 +857,4 @@ class TTSRouter:
             cost = gemini_cost(prepared, sep_style, secs, model)
             await self.budget.record("gemini", cost, chars=len(prepared), audio_ms=int(secs * 1000))
         self._cache.put(key, audio)
-        return SynthResult(audio, audio_format(audio), provider, None, cost)
+        return SynthResult(audio, audio_format(audio), provider, None, cost, model=model)

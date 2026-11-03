@@ -188,6 +188,83 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         db, ctx, sent = await self._run_recent((None, None, None), history=[])
         self.assertIn("No voice history", ctx.send.await_args.args[0])
 
+    async def test_gemini_fallbacks_prefer_history_then_same_name_google(self):
+        db = Mock()
+        db.fetchrow = AsyncMock(side_effect=[
+            {"voice": "fish:" + "a" * 32, "voice_label": "Guyzo"},                 # last non-Gemini voice
+            {"voice_name": "en-US-Chirp3-HD-Despina", "nickname": "Elizabeth"},  # same name on Google
+        ])
+        db.fetch = AsyncMock()
+        self.bot.db_pool = db
+        refs = await self.cog._gemini_fallbacks(1, 2, "gemini:despina@gemini-2.5-flash-preview-tts")
+        self.assertEqual(refs, [("fish:" + "a" * 32, "Guyzo"), ("en-US-Chirp3-HD-Despina", "Elizabeth")])
+        self.assertEqual(db.fetchrow.await_args_list[1].args[1], "en-US-Chirp3-HD-despina")
+        db.fetch.assert_not_awaited()
+        self.assertEqual(await self.cog._gemini_fallbacks(1, 2, "gemini:despina@gemini-2.5-flash-preview-tts"), refs)
+        self.assertEqual(db.fetchrow.await_count, 2)  # cached
+
+    async def test_gemini_fallback_without_history_or_same_name_is_stable(self):
+        pool = [{"voice_name": f"en-US-Chirp3-HD-V{i}", "nickname": f"N{i}"} for i in range(30)]
+        db = Mock()
+        db.fetchrow = AsyncMock(return_value=None)
+        db.fetch = AsyncMock(return_value=pool)
+        self.bot.db_pool = db
+        first = await self.cog._gemini_fallbacks(1, 7, "gemini:storyteller-2")
+        self.cog._fallback_cache.clear()
+        again = await self.cog._gemini_fallbacks(1, 7, "gemini:storyteller-2")
+        self.assertEqual(first, again)
+        self.assertEqual(first, [("en-US-Chirp3-HD-V7", "N7")])
+
+    async def test_gemini_out_of_quota_switches_the_users_voice_once(self):
+        self.cog._gemini_fallbacks = AsyncMock(return_value=[("en-US-Chirp3-HD-Kore", "Sofia")])
+        self.cog._switch_off_gemini = AsyncMock()
+        self.cog._notify_fallback = AsyncMock()
+        calls = []
+
+        async def synth(voice, part, **kw):
+            calls.append(voice)
+            if voice.startswith("gemini:"):
+                return SynthResult(OGG, "ogg_opus", "google", "gemini_limit", voice_ref_used="en-US-Chirp3-HD-Kore")
+            return SynthResult(OGG, "ogg_opus", "google", None, voice_ref_used=voice)
+
+        self.cog.router.synth = AsyncMock(side_effect=synth)
+        long_text = " ".join(f"This is sentence number {i}." for i in range(20))
+        await self.cog._narrate_one(1, 2, long_text, "gemini:kore", None, 1.0, 5, self.session.generation)
+        self.cog._switch_off_gemini.assert_awaited_once()
+        self.assertEqual(self.cog._switch_off_gemini.await_args.args[3:], ("gemini:kore", "en-US-Chirp3-HD-Kore", "Sofia"))
+        self.assertEqual(calls[0], "gemini:kore")
+        self.assertTrue(all(v == "en-US-Chirp3-HD-Kore" for v in calls[1:]))  # rest of the message uses it
+        self.cog._notify_fallback.assert_not_awaited()
+
+    async def test_gemini_error_uses_fallback_without_switching(self):
+        self.cog._gemini_fallbacks = AsyncMock(return_value=[("en-US-Chirp3-HD-Kore", "Sofia")])
+        self.cog._switch_off_gemini = AsyncMock()
+        self.cog._notify_fallback = AsyncMock()
+        self.cog.router.synth = AsyncMock(return_value=SynthResult(
+            OGG, "ogg_opus", "google", "error", voice_ref_used="en-US-Chirp3-HD-Kore"))
+        await self.cog._narrate_one(1, 2, "hello there", "gemini:kore", None, 1.0, 5, self.session.generation)
+        self.cog._switch_off_gemini.assert_not_awaited()
+        self.cog._notify_fallback.assert_awaited_once()
+
+    async def test_switch_off_gemini_saves_and_announces(self):
+        db = Mock()
+        db.execute = AsyncMock()
+        db.fetchrow = AsyncMock(return_value=None)
+        self.bot.db_pool = db
+        self.bot.command_prefix = "!"
+        ch = Mock()
+        ch.send = AsyncMock()
+        self.guild.get_channel.return_value = ch
+        self.member.display_name = "melon"
+        await self.cog._switch_off_gemini(self.guild, 2, 5, "gemini:kore@gemini-2.5-flash-preview-tts",
+                                          "en-US-Chirp3-HD-Kore", "Sofia")
+        update = db.execute.await_args_list[0].args
+        self.assertIn("UPDATE narrate_prefs", update[0])
+        self.assertEqual(update[1:], (1, 2, "en-US-Chirp3-HD-Kore", "Sofia", "gemini:kore@gemini-2.5-flash-preview-tts"))
+        msg = ch.send.await_args.args[0]
+        self.assertIn("melon", msg)
+        self.assertIn("!narrate voice gemini:kore@gemini-2.5-flash-preview-tts", msg)
+
     def test_bot_commands_are_not_narrated(self):
         bot = Mock(command_prefix="!")
         bot.get_command = lambda name: Mock() if name.lower() in {"quota", "narrate", "rate"} else None

@@ -76,21 +76,41 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         res = await self.router.synth("gemini:kore", "hello")
         self.assertEqual((res.provider, res.fallback_reason), ("google", "gemini_limit"))
 
-    async def test_gemini_out_of_quota_uses_fish_standin(self):
+    async def test_gemini_out_of_quota_uses_first_working_fallback(self):
         self.gemini.synth.side_effect = RateLimited("gemini", 429, "all models at their limits")
-        router = TTSRouter(self.google, self.fish, self.gemini, self.budget, fish_standin_voice=FISH_ID)
-        res = await router.synth("gemini:kore", "hello", style="calm")
-        self.assertEqual((res.provider, res.fallback_reason), ("fish", "gemini_limit"))
+        res = await self.router.synth("gemini:kore", "hello", style="calm",
+                                      fallback_refs=[f"fish:{FISH_ID}", "en-US-Chirp3-HD-Kore"])
+        self.assertEqual((res.provider, res.fallback_reason, res.voice_ref_used),
+                         ("fish", "gemini_limit", f"fish:{FISH_ID}"))
         self.fish.synth.assert_awaited_once_with("[calm] hello", FISH_ID, speed=1.0)
         self.google.synth.assert_not_awaited()
         self.assertGreater(res.cost_usd, 0)
 
-    async def test_gemini_error_also_uses_fish_standin(self):
+    async def test_failed_fallback_moves_to_the_next_one(self):
         self.gemini.synth.side_effect = ProviderError("gemini", 400, "bad request")
-        router = TTSRouter(self.google, self.fish, self.gemini, self.budget, fish_standin_voice=FISH_ID)
-        res = await router.synth("gemini:kore", "hello")
-        self.assertEqual((res.provider, res.fallback_reason), ("fish", "error"))
-        self.google.synth.assert_not_awaited()
+        self.fish.synth.side_effect = ProviderError("fish", 402, "no credit")
+        res = await self.router.synth("gemini:kore", "hello",
+                                      fallback_refs=["gemini:puck", f"fish:{FISH_ID}", "en-US-Chirp3-HD-Kore"])
+        self.assertEqual((res.provider, res.fallback_reason, res.voice_ref_used),
+                         ("google", "error", "en-US-Chirp3-HD-Kore"))
+        self.assertEqual(self.google.synth.await_args.kwargs["voice_name"], "en-US-Chirp3-HD-Kore")
+        self.assertEqual(self.gemini.synth.await_count, 1)  # the Gemini fallback ref was skipped
+
+    async def test_no_fallbacks_means_default_google(self):
+        self.gemini.synth.side_effect = RateLimited("gemini", 429, "out")
+        res = await self.router.synth("gemini:kore", "hello")
+        self.assertEqual(res.voice_ref_used, tts_providers.DEFAULT_GOOGLE_VOICE)
+
+    async def test_over_budget_skips_fish_fallbacks(self):
+        await self.budget.record("fish", 10.0)
+        res = await self.router.synth("gemini:kore", "hello",
+                                      fallback_refs=[f"fish:{FISH_ID}", "en-US-Chirp3-HD-Kore"])
+        self.assertEqual((res.fallback_reason, res.voice_ref_used), ("budget", "en-US-Chirp3-HD-Kore"))
+        self.fish.synth.assert_not_awaited()
+
+    async def test_primary_success_reports_voice_and_model(self):
+        res = await self.router.synth("gemini:kore", "hi there")
+        self.assertEqual((res.voice_ref_used, res.model), ("gemini:kore", "gemini-3.8-flash-tts"))
 
     async def test_fish_rate_limit_falls_back_to_google(self):
         self.fish.synth.side_effect = RateLimited("fish", 429, "slow down")
@@ -283,6 +303,20 @@ class GeminiChainTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ProviderError) as cm:
             await g.synth("hi", "kore")
         self.assertNotIsInstance(cm.exception, RateLimited)
+
+    async def test_short_wait_stays_on_the_same_model(self):
+        g = self.make()
+        g._synth_one.side_effect = [RateLimited("gemini", 429, "Please retry in 0.1s"), WAV_1S]
+        self.assertEqual(await g.synth("hi", "kore"), (WAV_1S, "m1"))
+        self.assertEqual([c.args[0] for c in g._synth_one.await_args_list], ["m1", "m1"])
+        self.assertEqual(g.blocked_for("m1"), 0)
+
+    def test_seed_is_fixed_per_voice(self):
+        seed = tts_providers.GeminiTTSProvider.voice_seed
+        self.assertEqual(seed("kore"), seed("Kore"))
+        self.assertNotEqual(seed("kore"), seed("puck"))
+        body = tts_providers.GeminiTTSProvider.build_body("gemini-3.8-flash-tts", "hi", "kore", None)
+        self.assertEqual(body["generation_config"]["seed"], seed("kore"))
 
     def test_retry_after_parsing(self):
         self.assertEqual(tts_providers.retry_after_secs("Please retry in 11h8m36s or upgrade"), 40116)
