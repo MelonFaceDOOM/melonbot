@@ -7,7 +7,7 @@ import math
 import traceback
 import subprocess
 from datetime import date, timedelta
-from typing import Optional, Dict, Tuple, List, Union
+from typing import Awaitable, Callable, Optional, Dict, Tuple, List, Union
 import discord
 from discord.ext import commands
 from config import (
@@ -39,6 +39,7 @@ USER_BURST_CHARS = 4000                    # per-user token bucket: burst size..
 USER_REFILL_CHARS_PER_SEC = 2000 / 60      # ...and refill: 2000 chars/min, ~2.4x faster than speech plays
 USER_BUDGET_SHARE = 0.5                    # one user may spend at most this share of the monthly budget
 SELF_DISCONNECT_GRACE_SECS = 15            # voice-state events this soon after our own disconnect aren't kicks
+ALONE_DISCONNECT_SECS = 10                 # safety net (checked every 5s): leave if no humans have been in the bot's channel this long
 RATE_MIN, RATE_MAX = 0.25, 4.0
 PLAYBACK_IDLE_DISCONNECT_SECS = 3600       # leave VC when idle
 # Voice ref for users who haven't picked one; existing Google picks are left alone.
@@ -158,6 +159,61 @@ def _short_voice_name(voice_name: str) -> str:
     parts = voice_name.split("-", 2)
     return parts[2] if len(parts) >= 3 else voice_name
 
+# (heading, [(command, what it does)]) for `!narrate` with no subcommand; commands get the prefix + "narrate "
+HELP_SECTIONS = [
+    ("▶️ Getting started", [
+        ("on [#channel]", "read your messages from this channel (or #channel) into your voice channel"),
+        ("off", "stop reading your messages (leaving voice does this too)"),
+        ("cancel", "stop what's playing right now (also `x`)"),
+        ("channel [#channel|thread]", "change which channel gets read"),
+        ("status", "who has narration on, and with which voice"),
+    ]),
+    ("🎙️ Voices", [
+        ("voices", "where to find Fish, Gemini and Google voices"),
+        ("voice <link | ID | gemini:Name | google name>", "pick your voice. Add `@2.5` etc. to a Gemini voice to prefer a model"),
+        ("recent [n,p] [@someone]", "voices someone has used, newest first, with commands to switch back"),
+        ("rate <0.25–4>", "speaking speed (1 is normal)"),
+    ]),
+    ("🎭 Delivery (Fish & Gemini voices)", [
+        ("style <text | off>", "default delivery for your messages, e.g. `dry and sarcastic`"),
+    ]),
+    ("🎨 Make your own", [
+        ("design <description>", "invent a voice. I DM you 3 takes to pick from, privately"),
+        ("designs", "your designed voices, usable in any server"),
+    ]),
+    ("💾 Voicelines", [
+        ("save <name>", "save your last narrated message; typing `<name>` later plays it back"),
+        ("list", "this server's saved voicelines"),
+        ("rename <old> <new>", "rename a voiceline (whoever saved it, or a server manager)"),
+        ("delete <name>", "delete a voiceline (same rule)"),
+    ]),
+    ("📊 Spending", [
+        ("quota", "your and this server's premium-voice spend this month"),
+        ("usage", "spend per provider this month (server managers)"),
+    ]),
+    ("🛑 Server managers", [
+        ("shutoff", "turn narration off for everyone and leave voice"),
+    ]),
+]
+HELP_DELIVERY_TIPS = ("Start a message with `[whispering]`, `[excited]`, `[very sad]`… to set how it's read.\n"
+                      "Drop `[laugh]` `[sigh]` `[gasp]` `[pause]` anywhere in it.")
+
+
+def _help_embed(prefix: str) -> discord.Embed:
+    p = f"{prefix}narrate"
+    embed = discord.Embed(
+        title="📖 Narrate",
+        description="Reads your messages aloud in voice chat, in the voice you pick.",
+        color=VOICES_EMBED_COLOR,
+    )
+    for heading, cmds in HELP_SECTIONS:
+        value = "\n".join(f"`{p} {cmd}` · {what}" for cmd, what in cmds)
+        if heading.startswith("🎭"):
+            value += "\n" + HELP_DELIVERY_TIPS
+        embed.add_field(name=heading, value=value, inline=False)
+    embed.set_footer(text=f"New here? Try {p} voices, then {p} on.")
+    return embed
+
 def _gemini_model_choices() -> str:
     """'`3.8` `3.8-lite` `3.1` `2.5` `2.5-pro`': one short name per model, in chain order."""
     seen, names = set(), []
@@ -259,6 +315,20 @@ class GuildVoiceSession():
         self.generation = 0
         # When we last disconnected on purpose (recycle), so the voice-state echo isn't treated as a kick.
         self.self_disconnect_at = 0.0
+        # Set by the cog: called when the bot has been alone in its channel too long (turns narration off + leaves)
+        self.on_alone: Optional[Callable[[], Awaitable[None]]] = None
+        self.alone_since: Optional[float] = None
+
+    def _alone_too_long(self, vc, now: float) -> bool:
+        members = getattr(getattr(vc, "channel", None), "members", None)
+        if not isinstance(members, (list, tuple)):
+            return False
+        if any(not getattr(m, "bot", False) for m in members):
+            self.alone_since = None
+            return False
+        if self.alone_since is None:
+            self.alone_since = now
+        return now - self.alone_since >= ALONE_DISCONNECT_SECS
 
     def recently_self_disconnected(self) -> bool:
         return time.monotonic() - self.self_disconnect_at < SELF_DISCONNECT_GRACE_SECS
@@ -278,6 +348,7 @@ class GuildVoiceSession():
             # Sessions survive disconnects and can exist long before the first join.
             # Claiming a channel is activity, even if no narration follows it.
             self.last_activity = time.monotonic()
+            self.alone_since = None
             if not (self.voice_client and self.voice_client.is_connected()):
                 # discord.py may still hold a connection we lost track of (or is reconnecting it);
                 # connect() would raise "Already connected", so adopt it instead.
@@ -403,9 +474,19 @@ class GuildVoiceSession():
             while True:
                 await asyncio.sleep(5)
                 now = time.monotonic()
+                vc = self.voice_client
+                connected = bool(vc and vc.is_connected())
+                # Safety net for missed leave events: never sit alone in a channel
+                if connected and self._alone_too_long(vc, now):
+                    print(f"[narrate] alone in voice for {ALONE_DISCONNECT_SECS}s, leaving: guild={self.guild_id}")
+                    if self.on_alone:
+                        await self.on_alone()
+                    else:
+                        await self.teardown()
+                    return
                 if (now - self.last_activity) <= PLAYBACK_IDLE_DISCONNECT_SECS:
                     # If not connected, nothing to do—exit quietly
-                    if not self.voice_client or not self.voice_client.is_connected():
+                    if not connected:
                         return
                     continue
                 print(f"[narrate] idle disconnect: guild={self.guild_id}, idle={now - self.last_activity:.0f}s")
@@ -705,6 +786,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         sess = self.guild_sessions.get(guild_id)
         if not sess:
             sess = GuildVoiceSession(self.bot, guild_id, self.tts)
+            sess.on_alone = lambda gid=guild_id: self._shut_down_alone(gid)
             self.guild_sessions[guild_id] = sess
         return sess
 
@@ -832,6 +914,60 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         )
         return row is not None
 
+    def _bot_voice_channel(self, guild: discord.Guild, session: "GuildVoiceSession"):
+        """Where the bot actually is. The session's own record can be empty after a restart or a voice reconnect
+        it didn't see, so fall back to discord.py's voice client and then Discord's voice state."""
+        vc = session.voice_client
+        if vc and vc.is_connected():
+            return vc.channel
+        gvc = getattr(guild, "voice_client", None)
+        if isinstance(gvc, discord.VoiceClient) and gvc.channel:
+            return gvc.channel
+        me = getattr(guild, "me", None)
+        voice = getattr(me, "voice", None)
+        return getattr(voice, "channel", None) if isinstance(voice, discord.VoiceState) else None
+
+    async def _leave_voice(self, guild: discord.Guild, session: "GuildVoiceSession") -> None:
+        """Leave voice for sure: the tracked connection, any connection discord.py still holds, and any leftover
+        presence (e.g. from before a restart)."""
+        await session.teardown()
+        gvc = getattr(guild, "voice_client", None)
+        if isinstance(gvc, discord.VoiceClient):
+            try:
+                await gvc.disconnect(force=True)
+            except Exception as e:
+                print(f"[narrate] leftover voice client disconnect failed: {e}")
+        voice = getattr(getattr(guild, "me", None), "voice", None)
+        if isinstance(voice, discord.VoiceState) and voice.channel:
+            try:
+                await guild.change_voice_state(channel=None)
+            except Exception as e:
+                print(f"[narrate] couldn't clear leftover voice state: {e}")
+
+    async def _shut_down_alone(self, guild_id: int) -> None:
+        """Bot was left alone in its channel: nobody is listening, so narration is off for everyone."""
+        guild = self.bot.get_guild(guild_id)
+        try:
+            await self._set_all_prefs_disabled(guild_id)
+        except Exception as e:
+            print(f"[narrate] failed to disable narration when alone: {e}")
+        if guild:
+            await self._leave_voice(guild, self._get_session(guild_id))
+        else:
+            await self._get_session(guild_id).teardown()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        # After a restart Discord can still show the bot in a channel it no longer has a connection to.
+        for guild in self.bot.guilds:
+            voice = getattr(guild.me, "voice", None)
+            if voice and voice.channel and not guild.voice_client:
+                print(f"[narrate] clearing leftover voice presence in guild={guild.id}")
+                try:
+                    await guild.change_voice_state(channel=None)
+                except Exception as e:
+                    print(f"[narrate] couldn't clear leftover voice state: {e}")
+
     async def _disconnect_if_no_enabled_in_channel(self, guild_id: int, channel: discord.VoiceChannel, session: "GuildVoiceSession") -> None:
         """Disconnect from voice if nobody in channel has it enabled.
         Others outside the channel may have it enabled,
@@ -842,7 +978,11 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         vc = session.voice_client
 
         if not has_enabled:
-            await session.teardown()
+            guild = self.bot.get_guild(guild_id)
+            if guild:
+                await self._leave_voice(guild, session)
+            else:
+                await session.teardown()
             await self._set_all_prefs_disabled(guild_id)
 
     async def _load_keyword_cache(self) -> Dict[int, Dict[str, str]]:
@@ -1130,34 +1270,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     # ---------- Commands ----------
     @commands.group(name="narrate", invoke_without_command=True)
     async def narrate_root(self, ctx: commands.Context):
-        usage = (
-            "Usage:\n"
-            "  !narrate on [#text-channel]\n"
-            "  !narrate off\n"
-            "  !narrate status\n"
-            "  !narrate cancel   (alias: !narrate x)\n"
-            "  !narrate channel [#text-channel|thread]\n"
-            "  !narrate voice <fish voice link|gemini:name|google voice-name|short-name>\n"
-            "  !narrate voices [language] [gender]   (no args: where to find voices)\n"
-            "  !narrate style <delivery|off>       (default style, e.g. 'dry and sarcastic')\n"
-            "  !narrate design <description>       (create a brand-new voice; samples come by DM)\n"
-            "  !narrate designs                    (your designed voices)\n"
-            "  !narrate recent [n,p] [@someone]    (voices someone has used, newest first)\n"
-            "  !narrate rate <float>\n"
-            "  !narrate usage                      (this month's TTS spend)\n"
-            "  !narrate quota                      (your + this server's premium-voice spend)\n"
-            "  !narrate save <voiceline-name>      (saves your most recently narrated audio)\n"
-            "  !narrate list                       (lists saved voicelines for this server)\n"
-            "  !narrate rename <old> <new>\n"
-            "  !narrate delete <voiceline-name>\n"
-            "  !narrate shutoff\n"
-            "\n"
-            "Tip: start a message with [whispering] / [excited] / [very sad] etc. to set how it's read,\n"
-            "and use [laugh] [sigh] [gasp] [pause] anywhere (Fish & Gemini voices only)."
-        )
-        # Show the prefix this bot actually uses (dev runs with '?')
-        usage = usage.replace("!narrate", f"{ctx.clean_prefix}narrate")
-        await ctx.send(usage, suppress_embeds=True)
+        await ctx.send(embed=_help_embed(ctx.clean_prefix))
 
     @narrate_root.command(name="on", aliases=["start"])
     async def narrate_on(self, ctx: commands.Context):
@@ -1765,7 +1878,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     async def narrate_shutoff(self, ctx: commands.Context):
         await self._set_all_prefs_disabled(ctx.guild.id)
         session = self._get_session(ctx.guild.id)
-        await session.teardown()
+        await self._leave_voice(ctx.guild, session)
         await ctx.send("Narrate has been shut off.", suppress_embeds=True)
 
     # ---------- Events ----------
@@ -1801,8 +1914,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             return
 
         session = self._get_session(guild.id)
-        bot_vc = session.voice_client
-        bot_chan = bot_vc.channel if (bot_vc and bot_vc.is_connected()) else None
+        bot_chan = self._bot_voice_channel(guild, session)
 
         prev_chan = before.channel   # None if previously not in VC
         new_chan  = after.channel    # None if now not in VC
@@ -1821,17 +1933,24 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             except Exception as e:
                 print(f"[narrate] failed to disable user {member.id} on leave: {e}")
 
-            # If nobody remaining in the bot VC has narrate enabled → shut down
-            try:
-                still_has_enabled = await self._any_enabled_in_channel(guild.id, bot_chan) if bot_chan else False
-            except Exception as e:
-                print(f"[narrate] enabled check error: {e}")
-                still_has_enabled = True  # be conservative
+            # Nobody left in the channel (bots don't count), or nobody left with narrate on → shut down
+            humans_left = [m for m in getattr(bot_chan, "members", []) if not m.bot]
+            if not humans_left:
+                still_has_enabled = False
+            else:
+                try:
+                    still_has_enabled = await self._any_enabled_in_channel(guild.id, bot_chan)
+                except Exception as e:
+                    print(f"[narrate] enabled check error: {e}")
+                    still_has_enabled = True  # be conservative while people are still there
 
             if not still_has_enabled:
                 # Do the underlying actions directly (don’t call the command since we have no ctx)
-                await self._set_all_prefs_disabled(guild.id)
-                await session.teardown()
+                try:
+                    await self._set_all_prefs_disabled(guild.id)
+                except Exception as e:
+                    print(f"[narrate] failed to disable narration on leave: {e}")
+                await self._leave_voice(guild, session)
             return
 
         # --- Case 2: user joins a voice channel from nothing

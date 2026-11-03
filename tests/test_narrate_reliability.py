@@ -467,10 +467,102 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("gemini:Kore@2.5", gemini)
         self.assertIn("`2.5-pro`", gemini)
 
+    def test_help_embed_sections_cover_every_command(self):
+        embed = bot_narrate._help_embed("?")
+        text = "\n".join(f.value for f in embed.fields)
+        names = {f.name for f in embed.fields}
+        self.assertIn("🎙️ Voices", names)
+        self.assertIn("[whispering]", text)
+        self.assertNotIn("!narrate", text)
+        for cmd in self.cog.narrate_root.commands:
+            self.assertIn(f"`?narrate {cmd.name}", text, f"help is missing {cmd.name}")
+        self.assertTrue(all(len(f.value) <= 1024 for f in embed.fields))
+        self.assertLess(len(embed), 6000)
+
     async def test_voices_embed_without_paid_providers(self):
         ctx = Mock(clean_prefix="!")
         embed = await self.cog._voices_embed(ctx)
         self.assertEqual([f.name for f in embed.fields], ["🔊 Google"])
+
+    def _leave_event(self, members_left, untracked=True):
+        chan = Mock(id=10)
+        chan.members = members_left
+        guild = Mock(id=1)
+        guild.me = Mock(id=99, voice=None)
+        gvc = Mock(spec=discord.VoiceClient)
+        gvc.channel = chan
+        gvc.disconnect = AsyncMock()
+        guild.voice_client = gvc
+        guild.change_voice_state = AsyncMock()
+        if untracked:
+            self.session.voice_client = None   # e.g. after a restart or an unseen reconnect
+        member = Mock(id=5, bot=False, guild=guild)
+        self.cog._set_enabled = AsyncMock()
+        self.cog._set_all_prefs_disabled = AsyncMock()
+        self.cog._any_enabled_in_channel = AsyncMock(return_value=True)
+        self.session.teardown = AsyncMock()
+        return guild, gvc, chan, member
+
+    async def test_last_person_leaving_turns_everything_off_even_if_connection_untracked(self):
+        guild, gvc, chan, member = self._leave_event(members_left=[])
+        await self.cog.on_voice_state_update(member, Mock(channel=chan), Mock(channel=None))
+        self.cog._set_enabled.assert_awaited_once_with(1, 5, False)
+        self.cog._set_all_prefs_disabled.assert_awaited_once_with(1)
+        self.session.teardown.assert_awaited_once()
+        gvc.disconnect.assert_awaited_once_with(force=True)
+
+    async def test_only_bots_left_counts_as_empty(self):
+        guild, gvc, chan, member = self._leave_event(members_left=[Mock(bot=True)])
+        await self.cog.on_voice_state_update(member, Mock(channel=chan), Mock(channel=None))
+        self.cog._any_enabled_in_channel.assert_not_awaited()
+        self.cog._set_all_prefs_disabled.assert_awaited_once_with(1)
+        gvc.disconnect.assert_awaited_once()
+
+    async def test_someone_with_narrate_still_there_keeps_the_bot(self):
+        guild, gvc, chan, member = self._leave_event(members_left=[Mock(bot=False)])
+        await self.cog.on_voice_state_update(member, Mock(channel=chan), Mock(channel=None))
+        self.cog._set_enabled.assert_awaited_once_with(1, 5, False)   # the leaver is still turned off
+        self.cog._set_all_prefs_disabled.assert_not_awaited()
+        gvc.disconnect.assert_not_awaited()
+
+    async def test_leftover_presence_is_cleared(self):
+        chan = Mock(id=10)
+        guild = Mock(id=1, voice_client=None)
+        guild.me = Mock(id=99)
+        guild.me.voice = Mock(spec=discord.VoiceState)
+        guild.me.voice.channel = chan
+        guild.change_voice_state = AsyncMock()
+        self.session.teardown = AsyncMock()
+        self.assertIs(self.cog._bot_voice_channel(guild, self.session), chan)
+        await self.cog._leave_voice(guild, self.session)
+        guild.change_voice_state.assert_awaited_once_with(channel=None)
+        self.bot.guilds = [guild]
+        guild.change_voice_state.reset_mock()
+        await self.cog.on_ready()
+        guild.change_voice_state.assert_awaited_once_with(channel=None)
+
+    async def test_alone_safety_net_turns_narration_off_and_leaves(self):
+        sess = bot_narrate.GuildVoiceSession(Mock(), 1, Mock())
+        vc = Mock()
+        vc.is_connected.return_value = True
+        vc.channel.members = [Mock(bot=True)]
+        sess.voice_client = vc
+        sess.on_alone = AsyncMock()
+        sess.alone_since = time.monotonic() - bot_narrate.ALONE_DISCONNECT_SECS - 1
+        with patch.object(bot_narrate.asyncio, "sleep", AsyncMock(side_effect=[None, asyncio.CancelledError])):
+            try:
+                await sess._idle_loop()
+            except asyncio.CancelledError:
+                pass
+        sess.on_alone.assert_awaited_once()
+
+    async def test_alone_timer_resets_when_someone_is_there(self):
+        sess = bot_narrate.GuildVoiceSession(Mock(), 1, Mock())
+        vc = Mock()
+        vc.channel.members = [Mock(bot=False)]
+        sess.alone_since = 123.0
+        self.assertFalse(sess._alone_too_long(vc, time.monotonic()))
+        self.assertIsNone(sess.alone_since)
 
     async def test_own_voice_recycle_is_not_treated_as_a_kick(self):
         self.cog._set_all_prefs_disabled = AsyncMock()
