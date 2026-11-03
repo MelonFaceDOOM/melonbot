@@ -99,6 +99,14 @@ DDL = [
     """
     ALTER TABLE tts_designed_voices ALTER COLUMN guild_id DROP NOT NULL
     """,
+    # 'design' or 'clone' (made from the creator's own recording); both are named and usable by anyone
+    """
+    ALTER TABLE tts_designed_voices ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'design'
+    """,
+    # Clones are named and a person can have several (an earlier draft allowed only one)
+    """
+    DROP INDEX IF EXISTS tts_designed_voices_one_clone_ux
+    """,
     """
     CREATE INDEX IF NOT EXISTS tts_designed_voices_user_idx
         ON tts_designed_voices (guild_id, user_id)

@@ -141,7 +141,7 @@ Adds Fish Audio and Gemini TTS alongside Google for `!narrate`:
 - `tts_user_usage` — month-to-date estimated spend per user; one user can use at most half the cap before their messages fall back to Google
 - `tts_guild_usage` — month-to-date estimated spend per server, shown by `!narrate quota`
 - `narrate_voice_history` — every voice a user picks, shown by `!narrate recent`; the migration seeds it with each user's current voice
-- `tts_designed_voices` — voices created with `!narrate design` (designed privately over DM; they belong to the user, so `guild_id` is nullable)
+- `tts_designed_voices` — voices created with `!narrate design` (designed privately over DM; they belong to the user, so `guild_id` is nullable) and `!narrate clone` (`kind='clone'`: made from the creator's own recording; named, public, several per user)
 
 `narrate_prefs.voice` now holds a voice ref: `fish:<model id>`, `gemini:<voice id>`, or a Google voice name (unchanged, so existing prefs keep working).
 

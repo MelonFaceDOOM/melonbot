@@ -20,6 +20,7 @@ from db_mixin import DbMixin
 from tts_providers import (
     BudgetTracker, FishTTSProvider, GeminiTTSProvider, GoogleTTSProvider, LRUCache, TTSRouter,
     DEFAULT_GOOGLE_VOICE, DEFAULT_LANG, DEFAULT_RATE, FISH_REF_PREFIX, FISH_VOICE_DESIGN_USD, ProviderError,
+    fish_cost,
     GEMINI_MODEL_ALIASES, GEMINI_MODEL_LABELS, audio_format, extract_fish_id, parse_voice_ref,
     resolve_gemini_model, split_gemini_voice,
 )
@@ -52,7 +53,21 @@ DESIGN_PREVIEW_LINE = ("Hey everyone, it's me. I have some news, and honestly, y
                        "Pull up a chair, because this one is a long story.")
 DESIGN_VIEW_TIMEOUT = 600
 # narrate subcommands that also work in a DM with the bot (designing a voice privately)
-DM_COMMANDS = frozenset({"narrate", "design", "designs"})
+DM_COMMANDS = frozenset({"narrate", "design", "designs", "clone"})
+
+# Voice cloning: the user reads this (consent sentence first) in a voice message sent to the bot by DM
+CLONE_CONSENT = "This is my own voice, and I agree to melonbot letting people use it to read messages."
+CLONE_SCRIPT = (CLONE_CONSENT + " The quick brown fox jumps over the lazy dog, then naps in the warm afternoon sun. "
+                "I'd like a large coffee, two sugars, and maybe a blueberry muffin if they have any left. "
+                "Honestly, the best part of any trip is the snacks, and nobody can convince me otherwise.")
+CLONE_MIN_SECS = 10
+CLONE_MAX_SECS = 180
+CLONE_MAX_BYTES = 15 * 1024 * 1024
+CLONE_WAIT_SECS = 600            # how long the bot waits for the recording
+CLONE_COOLDOWN_SECS = 60
+CLONE_MAX_ATTEMPTS = 8           # recordings per clone session
+CLONE_PREVIEW_LINE = "Hey everyone, it's me. This is what I sound like now, so let me know what you think."
+WHISPER_MODEL = "base.en"
 
 FISH_LIBRARY_URL = "https://fish.audio/voice-library/"
 GEMINI_VOICES_URL = "https://cloud.google.com/text-to-speech/docs/gemini-tts"
@@ -180,6 +195,8 @@ HELP_SECTIONS = [
     ("🎨 Make your own", [
         ("design <description>", "invent a voice. I DM you 3 takes to pick from, privately"),
         ("designs", "your designed voices, usable in any server"),
+        ("clone", "turn a recording of YOUR voice into a named, public voice (by DM, with a preview first). "
+                  "`voice clone <name>` uses one, `clone delete <name>` removes it"),
     ]),
     ("💾 Voicelines", [
         ("save <name>", "save your last narrated message; typing `<name>` later plays it back"),
@@ -197,6 +214,26 @@ HELP_SECTIONS = [
 ]
 HELP_DELIVERY_TIPS = ("Start a message with `[whispering]`, `[excited]`, `[very sad]`… to set how it's read.\n"
                       "Drop `[laugh]` `[sigh]` `[gasp]` `[pause]` anywhere in it.")
+
+
+def _consent_heard(transcript: str) -> bool:
+    """Did the recording include the consent sentence? Whisper mangles the made-up name ('Malambut'), so the
+    name can be a close match or be backed by the rest of the sentence."""
+    import difflib
+    t = " ".join(re.sub(r"[^a-z0-9 ]+", " ", (transcript or "").lower()).split())
+    if "my own voice" not in t or "agree" not in t:
+        return False
+    words = t.split()
+    names = words + [a + b for a, b in zip(words, words[1:])]  # 'melon bot' -> 'melonbot'
+    name_heard = any(difflib.SequenceMatcher(None, w, "melonbot").ratio() >= 0.7 for w in names)
+    return name_heard or "read messages" in t or "read my messages" in t
+
+
+def _decode_16k_mono(audio: bytes):
+    """Any audio -> float32 16 kHz mono samples (what Whisper wants), via ffmpeg."""
+    import numpy as np
+    pcm = _ffmpeg_convert(audio, ["-f", "f32le", "-ac", "1", "-ar", "16000"])
+    return np.frombuffer(pcm, dtype=np.float32)
 
 
 def _help_embed(prefix: str) -> discord.Embed:
@@ -279,14 +316,25 @@ def _join_to_ogg_opus(clips: List[bytes]) -> bytes:
         return subprocess.run(args, capture_output=True, check=True).stdout
 
 
+def _ffmpeg_convert(audio: bytes, out_args: List[str]) -> bytes:
+    """Run ffmpeg on audio bytes and return its stdout. The input goes through a temp file, not a pipe:
+    .m4a/.mp4 (e.g. Windows Sound Recorder) keep their index at the end and can't be decoded from a pipe."""
+    fd, path = tempfile.mkstemp(prefix="narrate_in_")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(audio)
+        return subprocess.run([FFMPEG_BIN, "-nostdin", "-loglevel", "error", "-i", path, *out_args, "pipe:1"],
+                              capture_output=True, check=True).stdout
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _transcode_to_ogg_opus(audio: bytes) -> bytes:
-    """Gemini returns WAV; voicelines are stored as OGG/Opus like everything else."""
-    proc = subprocess.run(
-        [FFMPEG_BIN, "-nostdin", "-loglevel", "error", "-i", "pipe:0",
-         "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1"],
-        input=audio, capture_output=True, check=True,
-    )
-    return proc.stdout
+    """Gemini WAV, uploaded recordings, ... -> OGG/Opus, which voicelines and clone samples are stored as."""
+    return _ffmpeg_convert(audio, ["-c:a", "libopus", "-b:a", "48k", "-f", "ogg"])
 
 
 # ==========================
@@ -529,6 +577,46 @@ class GuildVoiceSession():
             except asyncio.QueueEmpty:
                 pass
 
+class _CloneRejected(Exception):
+    """A recording that can't be used for cloning; the message is shown to the user."""
+
+
+class _ClonePreviewView(discord.ui.View):
+    """Keep / record again / cancel under a clone preview. `choice` is set once a button is pressed."""
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=CLONE_WAIT_SECS)
+        self.owner_id = owner_id
+        self.choice: Optional[str] = None
+        self.message: Optional[discord.Message] = None
+        for label, choice, style in (("Keep it", "keep", discord.ButtonStyle.success),
+                                     ("Record again", "redo", discord.ButtonStyle.primary),
+                                     ("Cancel", "cancel", discord.ButtonStyle.secondary)):
+            btn = discord.ui.Button(label=label, style=style)
+            btn.callback = self._choose(choice)
+            self.add_item(btn)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    def _choose(self, choice: str):
+        async def callback(interaction: discord.Interaction):
+            self.choice = choice
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(view=self)
+            self.stop()
+        return callback
+
+    async def on_timeout(self):
+        if self.message:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
 # ==========================
 # Voice design picker
 # ==========================
@@ -639,6 +727,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         # (guild_id, reason) -> (month, monotonic time) of the last fallback notice
         self._fallback_notices: Dict[Tuple[int, str], Tuple[date, float]] = {}
         self._design_last_used: Dict[int, float] = {}
+        self._clone_last_used: Dict[int, float] = {}
+        self._whisper = None  # faster-whisper model, loaded on first clone
 
     async def cog_load(self):
         try:
@@ -1461,11 +1551,23 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         q = _collapse_ws(voice).strip("<>")
         low = q.lower()
 
+        # One of your cloned voices, by name: `voice clone <name>` (or just `voice clone` if you have one)
+        if low == "clone" or low.startswith("clone "):
+            row, rows = await self._find_own_clone(ctx.author.id, q[6:].strip() or None)
+            if not rows:
+                return await ctx.send(f"You don't have a cloned voice yet. `{ctx.clean_prefix}narrate clone` makes one.",
+                                      suppress_embeds=True)
+            if not row:
+                names = ", ".join(f"`{r['title']}`" for r in rows)
+                return await ctx.send(f"Which one? `{ctx.clean_prefix}narrate voice clone <name>`. Yours: {names}",
+                                      suppress_embeds=True)
+            return await self._apply_voice(ctx, f"fish:{row['voice_id']}", row["title"], "cloned voice")
+
         # A locally kept designed voice: fish:ref:<key> (from !narrate designs)
         if low.startswith(f"fish:{FISH_REF_PREFIX}"):
             row = await self.db.fetchrow(
                 "SELECT title FROM tts_designed_voices WHERE provider='fish' AND voice_id=$1 "
-                "AND (user_id=$2 OR guild_id=$3)",  # your own designs anywhere; older ones shared per server
+                "AND (user_id=$2 OR guild_id=$3 OR kind='clone')",  # yours anywhere, server-shared designs, public clones
                 low[len("fish:"):], ctx.author.id, ctx.guild.id,
             )
             if not row:
@@ -1753,6 +1855,256 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         )
         return f"fish:{voice_id}"
 
+    @narrate_root.command(name="clone")
+    async def narrate_clone(self, ctx: commands.Context, action: Optional[str] = None, *, name: Optional[str] = None):
+        """Make a named voice from a recording of your own voice (by DM). `clone delete <name>` removes one."""
+        if action and action.lower() in ("delete", "remove", "del", "rm"):
+            return await self._delete_clone(ctx, name)
+        if not self.fish:
+            return await ctx.send("Voice cloning needs Fish Audio, which isn't set up on this bot.", suppress_embeds=True)
+        now = time.monotonic()
+        last = self._clone_last_used.get(ctx.author.id)
+        if last and now - last < CLONE_COOLDOWN_SECS:
+            return await ctx.send(f"Give it {int(CLONE_COOLDOWN_SECS - (now - last)) + 1}s before starting another.",
+                                  suppress_embeds=True)
+        if await self.budget.exhausted():
+            return await ctx.send("This month's TTS budget is used up, so cloning is off until next month.",
+                                  suppress_embeds=True)
+        if await self._get_whisper() is None:
+            return await ctx.send("Voice cloning isn't available on this bot right now (speech recognition for the "
+                                  "consent check isn't installed).", suppress_embeds=True)
+        user_id = await get_user_id(ctx, self.db)
+        if user_id is None:
+            return
+        self._clone_last_used[ctx.author.id] = now
+        try:
+            dm = await ctx.author.create_dm()
+            await dm.send(
+                "🎤 **Clone your voice**\n"
+                f"Record yourself reading this ({CLONE_MIN_SECS}+ seconds, quiet room), then send it here:\n"
+                f"> {CLONE_SCRIPT}\n"
+                "📱 **Phone:** hold the 🎤 button in this chat to send a voice message.\n"
+                "💻 **PC:** Discord desktop can't send voice messages, so record with Windows' **Sound Recorder** "
+                "(or any recorder) and drag the file into this chat.\n"
+                "The first sentence is your consent. You'll hear a preview before anything is saved, and you can "
+                f"redo it as often as you like. Type `cancel` to stop.",
+                suppress_embeds=True,
+            )
+        except discord.Forbidden:
+            return await ctx.send(
+                f"I couldn't DM you. Allow DMs from server members (Privacy Settings), or DM me "
+                f"`{ctx.clean_prefix}narrate clone` directly.", suppress_embeds=True)
+        if ctx.guild:
+            await ctx.send("📬 Check your DMs.", suppress_embeds=True)
+        await self._clone_session(ctx.author, dm, ctx.clean_prefix)
+
+    async def _clone_session(self, user, dm, prefix: str) -> None:
+        """Record -> check -> preview -> keep/redo -> name -> save, all in the DM."""
+        def from_user(m: discord.Message) -> bool:
+            return m.author.id == user.id and m.channel.id == dm.id
+
+        async def next_message() -> Optional[discord.Message]:
+            try:
+                return await self.bot.wait_for("message", check=from_user, timeout=CLONE_WAIT_SECS)
+            except asyncio.TimeoutError:
+                await dm.send(f"I didn't hear back, so I stopped. `{prefix}narrate clone` to start again.")
+                return None
+
+        attempts = 0
+        while True:
+            msg = await next_message()
+            if msg is None:
+                return
+            if (msg.content or "").strip().lower() == "cancel":
+                return await dm.send("Cancelled, nothing was saved.")
+            if not msg.attachments:
+                await dm.send("Send a voice message or an audio file of you reading the script (or `cancel`).")
+                continue
+            attempts += 1
+            if attempts > CLONE_MAX_ATTEMPTS:
+                return await dm.send(f"That's a lot of tries; let's stop here. `{prefix}narrate clone` to start fresh.")
+            att = msg.attachments[0]
+            if att.size > CLONE_MAX_BYTES:
+                await dm.send("That file is too big; a minute or so of speech is plenty. Send another (or `cancel`).")
+                continue
+            audio = await att.read()
+            try:
+                async with dm.typing():
+                    sample, transcript = await self._check_recording(audio)
+                    preview = await self._clone_preview(user.id, sample, transcript)
+            except _CloneRejected as e:
+                await dm.send(f"{e} Send another recording (or `cancel`).", suppress_embeds=True)
+                continue
+            except Exception as e:
+                print(f"[narrate] clone preview failed: {e!r}")
+                await dm.send("Something went wrong making the preview. Send the recording again (or `cancel`).")
+                continue
+
+            view = _ClonePreviewView(user.id)
+            view.message = await dm.send(
+                "🔊 Here's your cloned voice. Happy with it?",
+                file=discord.File(io.BytesIO(preview), filename="preview.ogg"), view=view)
+            if await view.wait() or view.choice == "cancel":   # wait() is True on timeout
+                return await dm.send("Okay, nothing was saved." if view.choice == "cancel"
+                                     else f"I didn't hear back, so nothing was saved. `{prefix}narrate clone` to start again.")
+            if view.choice == "redo":
+                await dm.send("No problem, send a new recording.")
+                continue
+            break  # keep
+
+        name = await self._ask_clone_name(user, dm, next_message)
+        if name is None:
+            return
+        try:
+            async with dm.typing():
+                ref = await self._save_clone(user, sample, transcript, name)
+        except Exception as e:
+            print(f"[narrate] saving clone failed: {e!r}")
+            return await dm.send("Something went wrong saving the voice; try again in a bit.")
+        await dm.send(
+            f"✅ **{discord.utils.escape_markdown(name)}** is saved. It's public: anyone can use it, and it's yours to "
+            "remove.\n"
+            f"Use it in a server: `{prefix}narrate voice clone {name}` (or `{prefix}narrate voice {ref}`, which "
+            f"anyone can use). Remove it: `{prefix}narrate clone delete {name}`.",
+            suppress_embeds=True)
+
+    async def _ask_clone_name(self, user, dm, next_message) -> Optional[str]:
+        await dm.send("What should this voice be called? (up to 60 characters, e.g. `Melon, sleepy`)")
+        while True:
+            msg = await next_message()
+            if msg is None:
+                return None
+            name = " ".join((msg.content or "").split())
+            if name.lower() == "cancel":
+                await dm.send("Cancelled, nothing was saved.")
+                return None
+            if not name or len(name) > 60 or "`" in name:
+                await dm.send("Give it a name of 1 to 60 characters (no backticks).")
+                continue
+            taken = await self.db.fetchrow(
+                "SELECT 1 FROM tts_designed_voices WHERE user_id=$1 AND lower(title)=lower($2)", user.id, name)
+            if taken:
+                await dm.send("You already have a voice with that name; pick another.")
+                continue
+            return name
+
+    async def _get_whisper(self):
+        """faster-whisper model for the consent check; None if it isn't installed."""
+        if self._whisper is None:
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError:
+                return None
+            self._whisper = await asyncio.to_thread(WhisperModel, WHISPER_MODEL, device="cpu", compute_type="int8")
+        return self._whisper
+
+    async def _transcribe(self, samples) -> str:
+        model = await self._get_whisper()
+
+        def run():
+            segs, _ = model.transcribe(samples, beam_size=5)
+            return " ".join(s.text for s in segs).strip()
+        return await asyncio.to_thread(run)
+
+    async def _check_recording(self, audio: bytes) -> Tuple[bytes, str]:
+        """Length + consent check. Returns (recording as OGG/Opus, transcript); raises _CloneRejected with a reason."""
+        try:
+            samples = await asyncio.to_thread(_decode_16k_mono, audio)
+        except Exception:
+            raise _CloneRejected("I couldn't read that audio file.")
+        secs = len(samples) / 16000
+        if secs < 0.5:
+            raise _CloneRejected("I couldn't read any audio in that file. A voice message, .m4a, .mp3, .wav or .ogg works.")
+        if secs < CLONE_MIN_SECS:
+            raise _CloneRejected(f"That was only {secs:.0f}s; read the whole script ({CLONE_MIN_SECS}+ seconds).")
+        if secs > CLONE_MAX_SECS:
+            raise _CloneRejected(f"That's over {CLONE_MAX_SECS // 60} minutes; the script alone is plenty.")
+        transcript = await self._transcribe(samples)
+        if not _consent_heard(transcript):
+            raise _CloneRejected("I couldn't hear the consent sentence at the start "
+                                 f"(\"{CLONE_CONSENT}\"). Make sure you read it clearly.")
+        ogg = audio if audio_format(audio) == "ogg_opus" else await asyncio.to_thread(_transcode_to_ogg_opus, audio)
+        return ogg, transcript
+
+    async def _clone_preview(self, user_id: int, sample: bytes, transcript: str) -> bytes:
+        """Speak a line in the would-be clone without saving anything (the recording is sent inline)."""
+        audio = await self.fish.synth(CLONE_PREVIEW_LINE, None, reference=(sample, transcript))
+        cost = fish_cost(CLONE_PREVIEW_LINE, self.fish.model)
+        await self.budget.record("fish", cost, chars=len(CLONE_PREVIEW_LINE))
+        await self._add_spend(None, user_id, cost)
+        return audio
+
+    async def _save_clone(self, user, sample: bytes, transcript: str, name: str) -> str:
+        """Create the (public, named) voice; returns its ref. Falls back to a local sample if Fish refuses."""
+        sample_path = None
+        try:
+            info = await self.fish.create_model(
+                title=name[:100], audio=sample, text=transcript,
+                description="Cloned from the creator's own recording via !narrate clone.")
+            voice_id = str(info["_id"]).lower()
+        except ProviderError as e:
+            if e.status not in (402, 403):
+                raise
+            print(f"[narrate] fish model creation refused, keeping clone locally: {e}")
+            key = uuid.uuid4().hex
+            sample_path = f"cloned/user_{user.id}/{key}.ogg"
+            root = Path(getattr(self, "persistent_audio_root", "data/audio"))
+            await asyncio.to_thread(_atomic_write_bytes, root / sample_path, sample)
+            voice_id = f"{FISH_REF_PREFIX}{key}"
+        await self.db.execute(
+            """
+            INSERT INTO tts_designed_voices (guild_id, user_id, provider, voice_id, title, instruction,
+                                             sample_path, sample_text, kind)
+            VALUES (NULL, $1, 'fish', $2, $3, 'cloned from own recording', $4, $5, 'clone')
+            """,
+            user.id, voice_id, name[:128], sample_path, transcript,
+        )
+        return f"fish:{voice_id}"
+
+    async def _remove_clone_row(self, voice_id: str, sample_path: Optional[str]) -> None:
+        if not voice_id.startswith(FISH_REF_PREFIX) and self.fish:
+            try:
+                await self.fish.delete_model(voice_id)
+            except Exception as e:
+                print(f"[narrate] couldn't delete cloned Fish model {voice_id}: {e}")
+        if sample_path:
+            try:
+                (Path(getattr(self, "persistent_audio_root", "data/audio")) / sample_path).unlink(missing_ok=True)
+            except OSError as e:
+                print(f"[narrate] couldn't remove clone sample {sample_path}: {e}")
+        await self.db.execute("DELETE FROM tts_designed_voices WHERE kind='clone' AND voice_id=$1", voice_id)
+        # It's public, so anyone using it goes back to the default voice
+        await self.db.execute(
+            "UPDATE narrate_prefs SET voice=NULL, voice_label=NULL, updated_at=CURRENT_TIMESTAMP WHERE voice=$1",
+            f"fish:{voice_id}")
+        self.router.forget_reference(voice_id)
+
+    async def _find_own_clone(self, user_id: int, name: Optional[str]):
+        """(row or None, all of the user's clones) where row is the clone matching `name` (or the only one)."""
+        rows = await self.db.fetch(
+            "SELECT voice_id, title, sample_path FROM tts_designed_voices WHERE kind='clone' AND user_id=$1 "
+            "ORDER BY created_at DESC", user_id)
+        rows = list(rows)
+        if not name:
+            return (rows[0] if len(rows) == 1 else None), rows
+        q = " ".join(name.split()).lower()
+        exact = [r for r in rows if r["title"].lower() == q]
+        partial = [r for r in rows if q in r["title"].lower()]
+        match = exact[0] if exact else (partial[0] if len(partial) == 1 else None)
+        return match, rows
+
+    async def _delete_clone(self, ctx: commands.Context, name: Optional[str]):
+        row, rows = await self._find_own_clone(ctx.author.id, name)
+        if not rows:
+            return await ctx.send("You don't have any cloned voices.", suppress_embeds=True)
+        if not row:
+            names = ", ".join(f"`{r['title']}`" for r in rows)
+            return await ctx.send(f"Which one? `{ctx.clean_prefix}narrate clone delete <name>`. Yours: {names}",
+                                  suppress_embeds=True)
+        await self._remove_clone_row(row["voice_id"], row["sample_path"])
+        await ctx.send(f"🗑️ Deleted **{discord.utils.escape_markdown(row['title'])}**, here and from the voice "
+                       "service. Anyone who was using it is back on the default voice.", suppress_embeds=True)
+
     async def _load_designed_sample(self, key: str) -> Optional[Tuple[bytes, str]]:
         """Router callback for fish:ref:<key> voices: (ogg sample, transcript), or None."""
         row = await self.db.fetchrow(
@@ -1842,7 +2194,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     async def narrate_designs(self, ctx: commands.Context):
         rows = await self.db.fetch(
             """
-            SELECT voice_id, title, created_at
+            SELECT voice_id, title, created_at, kind
             FROM tts_designed_voices
             WHERE user_id=$1
             ORDER BY created_at DESC
@@ -1851,11 +2203,12 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             ctx.author.id,
         )
         if not rows:
-            return await ctx.send(f"You haven't designed any voices yet. Try `{ctx.clean_prefix}narrate design <description>`.",
-                                  suppress_embeds=True)
-        lines = [f"Your designed voices, usable in any server with `{ctx.clean_prefix}narrate voice <id>`:"]
+            return await ctx.send(f"You haven't made any voices yet. Try `{ctx.clean_prefix}narrate design <description>` "
+                                  f"or `{ctx.clean_prefix}narrate clone`.", suppress_embeds=True)
+        lines = [f"Your voices, usable in any server with `{ctx.clean_prefix}narrate voice <id>`:"]
         for r in rows:
-            lines.append(f"- **{r['title']}**: `fish:{r['voice_id']}`")
+            tag = " 🎤 *cloned*" if r["kind"] == "clone" else ""
+            lines.append(f"- **{discord.utils.escape_markdown(r['title'])}**{tag}: `fish:{r['voice_id']}`")
         await ctx.send("\n".join(lines)[:1900], suppress_embeds=True)
 
     @narrate_root.command(name="rate")

@@ -377,6 +377,15 @@ class FishTTSProvider(_HttpProvider):
             raise ProviderError("fish", 200, "empty audio")
         return data
 
+    async def delete_model(self, model_id: str) -> bool:
+        """Delete a voice model the bot's Fish account owns. True if it's gone (deleted or already missing)."""
+        session = await self._sess()
+        async with session.delete(f"{FISH_MODEL_ENDPOINT}/{model_id}", headers=self._auth()) as resp:
+            if resp.status in (200, 204, 404):
+                self._model_cache.pop(model_id, None)
+                return True
+            raise ProviderError("fish", resp.status, await resp.text())
+
     async def get_model(self, model_id: str) -> Optional[dict]:
         """Voice model metadata, or None if it doesn't exist / isn't accessible."""
         if model_id in self._model_cache:
@@ -748,6 +757,9 @@ class TTSRouter:
         # Unsaved Fish voices ('fish:ref:<key>') are spoken from a stored sample; loader returns (audio, transcript)
         self._reference_loader = reference_loader
         self._references: Dict[str, Tuple[bytes, str]] = {}
+
+    def forget_reference(self, voice_id: str) -> None:
+        self._references.pop(voice_id.removeprefix(FISH_REF_PREFIX), None)
 
     async def _reference(self, key: str) -> Tuple[bytes, str]:
         if key not in self._references:

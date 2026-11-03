@@ -346,6 +346,207 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         await self.cog.cog_command_error(ctx, discord.ext.commands.NoPrivateMessage())
         self.assertIn("narrate design", ctx.send.await_args.args[0])
 
+    def test_consent_sentence_detection(self):
+        ok = bot_narrate._consent_heard
+        self.assertTrue(ok(bot_narrate.CLONE_CONSENT))
+        self.assertTrue(ok("This is my own voice and I agree to Malambut letting people use it to read messages."))
+        self.assertTrue(ok("this is my own voice and i agree to melon bot"))
+        self.assertFalse(ok("the quick brown fox jumps over the lazy dog"))
+        self.assertFalse(ok("this is my own voice"))
+
+    def _clone_db(self, row=None, rows=None):
+        db = Mock()
+        db.fetchrow = AsyncMock(return_value=row)
+        db.fetch = AsyncMock(return_value=rows or [])
+        db.execute = AsyncMock()
+        self.bot.db_pool = db
+        return db
+
+    def test_m4a_uploads_decode(self):
+        """Sound Recorder's .m4a keeps its index at the end; decoding from a pipe used to give 0 seconds."""
+        import shutil, subprocess, tempfile, os
+        if not shutil.which("ffmpeg"):
+            self.skipTest("ffmpeg not installed")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "rec.m4a")
+            subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "lavfi",
+                            "-i", "sine=frequency=220:duration=12", "-c:a", "aac", path], check=True)
+            audio = open(path, "rb").read()
+        self.assertAlmostEqual(len(bot_narrate._decode_16k_mono(audio)) / 16000, 12, delta=0.2)
+        self.assertEqual(bot_narrate._transcode_to_ogg_opus(audio)[:4], b"OggS")
+
+    async def test_recording_check_rejects_short_and_unconsented(self):
+        import numpy as np
+        with patch.object(bot_narrate, "_decode_16k_mono", Mock(return_value=np.zeros(16000 * 4, dtype=np.float32))):
+            with self.assertRaises(bot_narrate._CloneRejected) as cm:
+                await self.cog._check_recording(b"OggS audio")
+            self.assertIn("only 4s", str(cm.exception))
+        with patch.object(bot_narrate, "_decode_16k_mono", Mock(return_value=np.zeros(16000 * 20, dtype=np.float32))):
+            self.cog._transcribe = AsyncMock(return_value="the quick brown fox")
+            with self.assertRaises(bot_narrate._CloneRejected) as cm:
+                await self.cog._check_recording(b"OggS audio")
+            self.assertIn("consent", str(cm.exception))
+            self.cog._transcribe = AsyncMock(return_value=bot_narrate.CLONE_SCRIPT)
+            self.assertEqual(await self.cog._check_recording(b"OggS audio"), (b"OggS audio", bot_narrate.CLONE_SCRIPT))
+
+    def _clone_dm(self):
+        typing_cm = MagicMock()
+        typing_cm.__aenter__ = AsyncMock()
+        typing_cm.__aexit__ = AsyncMock(return_value=False)
+        dm = Mock(id=50)
+        dm.send = AsyncMock(return_value=Mock())
+        dm.typing = Mock(return_value=typing_cm)
+        return dm
+
+    @staticmethod
+    def _recording():
+        return Mock(content="", attachments=[Mock(size=1000, read=AsyncMock(return_value=b"OggS rec"))])
+
+    def _fake_preview_views(self, choices):
+        it = iter(choices)
+
+        class FakeView:
+            def __init__(self, owner_id):
+                self.choice = next(it)
+                self.message = None
+
+            async def wait(self):
+                return self.choice is None  # None = timed out
+        return FakeView
+
+    async def test_clone_session_redo_then_keep_then_name(self):
+        self._clone_db(row=None)   # name not taken
+        dm = self._clone_dm()
+        user = Mock(id=2)
+        names = iter([None, Mock(content="taken name", attachments=[]), Mock(content="Melon, sleepy", attachments=[])])
+        self.cog.db.fetchrow = AsyncMock(side_effect=[{"x": 1}, None])  # first name taken, second free
+        replies = [Mock(content="hello?", attachments=[]),        # not a recording
+                   self._recording(),                              # rejected
+                   self._recording(),                              # preview -> record again
+                   self._recording(),                              # preview -> keep
+                   Mock(content="taken name", attachments=[]),
+                   Mock(content="Melon, sleepy", attachments=[])]
+        self.bot.wait_for = AsyncMock(side_effect=replies)
+        self.cog._check_recording = AsyncMock(side_effect=[bot_narrate._CloneRejected("Too short."),
+                                                           (b"OggS a", "t1"), (b"OggS b", "t2")])
+        self.cog._clone_preview = AsyncMock(return_value=b"OggS preview")
+        self.cog._save_clone = AsyncMock(return_value="fish:abc")
+        with patch.object(bot_narrate, "_ClonePreviewView", self._fake_preview_views(["redo", "keep"])):
+            await self.cog._clone_session(user, dm, "!")
+        self.cog._save_clone.assert_awaited_once_with(user, b"OggS b", "t2", "Melon, sleepy")  # the kept take
+        sent = [c.args[0] if c.args else c.kwargs.get("content", "") for c in dm.send.await_args_list]
+        self.assertTrue(any("Too short." in m for m in sent))
+        self.assertTrue(any("send a new recording" in m for m in sent))
+        self.assertTrue(any("already have a voice with that name" in m for m in sent))
+        self.assertIn("Melon, sleepy", sent[-1])
+        self.assertIn("!narrate voice clone Melon, sleepy", sent[-1])
+        previews = [c for c in dm.send.await_args_list if "file" in c.kwargs]
+        self.assertEqual(len(previews), 2)                        # heard a preview before each decision
+
+    async def test_clone_session_cancel_at_preview_saves_nothing(self):
+        self._clone_db()
+        dm = self._clone_dm()
+        self.bot.wait_for = AsyncMock(side_effect=[self._recording()])
+        self.cog._check_recording = AsyncMock(return_value=(b"OggS a", "t"))
+        self.cog._clone_preview = AsyncMock(return_value=b"OggS preview")
+        self.cog._save_clone = AsyncMock()
+        with patch.object(bot_narrate, "_ClonePreviewView", self._fake_preview_views(["cancel"])):
+            await self.cog._clone_session(Mock(id=2), dm, "!")
+        self.cog._save_clone.assert_not_awaited()
+        self.assertIn("nothing was saved", dm.send.await_args.args[0])
+
+    async def test_clone_session_timeout_and_typed_cancel(self):
+        self._clone_db()
+        dm = self._clone_dm()
+        self.cog._save_clone = AsyncMock()
+        self.bot.wait_for = AsyncMock(side_effect=asyncio.TimeoutError)
+        await self.cog._clone_session(Mock(id=2), dm, "!")
+        self.assertIn("I didn't hear back", dm.send.await_args.args[0])
+        self.bot.wait_for = AsyncMock(return_value=Mock(content="cancel", attachments=[]))
+        await self.cog._clone_session(Mock(id=2), dm, "!")
+        self.assertIn("Cancelled", dm.send.await_args.args[0])
+        self.cog._save_clone.assert_not_awaited()
+
+    async def test_clone_instructions_cover_phone_and_pc(self):
+        self.cog.fish = Mock()
+        self.cog._get_whisper = AsyncMock(return_value=object())
+        self.cog.budget.exhausted = AsyncMock(return_value=False)
+        self.cog._clone_session = AsyncMock()
+        dm = self._clone_dm()
+        ctx = Mock(clean_prefix="!", guild=None)
+        ctx.author.id = 2
+        ctx.author.create_dm = AsyncMock(return_value=dm)
+        with patch.object(bot_narrate, "get_user_id", AsyncMock(return_value=2)):
+            await self.cog.narrate_clone.callback(self.cog, ctx)
+        intro = dm.send.await_args_list[0].args[0]
+        self.assertIn(bot_narrate.CLONE_CONSENT, intro)
+        self.assertIn("Phone", intro)
+        self.assertIn("Sound Recorder", intro)
+        self.cog._clone_session.assert_awaited_once()
+
+    async def test_clone_unavailable_without_speech_recognition(self):
+        self.cog.fish = Mock()
+        self.cog.budget.exhausted = AsyncMock(return_value=False)
+        self.cog._get_whisper = AsyncMock(return_value=None)
+        ctx = Mock(clean_prefix="!")
+        ctx.author.id = 2
+        ctx.send = AsyncMock()
+        await self.cog.narrate_clone.callback(self.cog, ctx)
+        self.assertIn("isn't available", ctx.send.await_args.args[0])
+
+    async def test_save_clone_is_named_and_public(self):
+        self.cog.fish = Mock()
+        self.cog.fish.create_model = AsyncMock(return_value={"_id": "NEW123"})
+        db = self._clone_db()
+        ref = await self.cog._save_clone(Mock(id=2), b"OggS a", "transcript", "Melon, sleepy")
+        self.assertEqual(ref, "fish:new123")
+        self.assertEqual(self.cog.fish.create_model.await_args.kwargs["title"], "Melon, sleepy")
+        sql, *args = db.execute.await_args.args
+        self.assertIn("'clone'", sql)
+        self.assertEqual(args[:3], [2, "new123", "Melon, sleepy"])
+
+    async def test_voice_clone_by_name(self):
+        rows = [{"voice_id": "aaa", "title": "Melon, sleepy", "sample_path": None},
+                {"voice_id": "bbb", "title": "Melon, shouting", "sample_path": None}]
+        self._clone_db(rows=rows)
+        self.cog._apply_voice = AsyncMock()
+        ctx = Mock(clean_prefix="!")
+        ctx.author.id = 2
+        ctx.send = AsyncMock()
+        await self.cog.narrate_voice.callback(self.cog, ctx, voice="clone melon, SHOUTING")
+        self.assertEqual(self.cog._apply_voice.await_args.args[1:3], ("fish:bbb", "Melon, shouting"))
+        self.cog._apply_voice.reset_mock()
+        await self.cog.narrate_voice.callback(self.cog, ctx, voice="clone")      # two clones: which one?
+        self.cog._apply_voice.assert_not_awaited()
+        self.assertIn("Which one?", ctx.send.await_args.args[0])
+
+    async def test_anyone_can_use_a_clone_by_id(self):
+        db = self._clone_db(row={"title": "Melon, sleepy"})
+        self.cog.fish = Mock()
+        self.cog._apply_voice = AsyncMock()
+        ctx = Mock(clean_prefix="!")
+        ctx.author.id, ctx.guild.id = 99, 1        # not the creator
+        await self.cog.narrate_voice.callback(self.cog, ctx, voice="fish:ref:" + "b" * 32)
+        self.assertIn("kind='clone'", db.fetchrow.await_args.args[0])
+        self.assertEqual(self.cog._apply_voice.await_args.args[2], "Melon, sleepy")
+
+    async def test_clone_delete_by_name_resets_everyone_using_it(self):
+        rows = [{"voice_id": "aaa", "title": "Melon, sleepy", "sample_path": None}]
+        db = self._clone_db(rows=rows)
+        self.cog.fish = Mock()
+        self.cog.fish.delete_model = AsyncMock(return_value=True)
+        ctx = Mock(clean_prefix="!")
+        ctx.author.id = 2
+        ctx.send = AsyncMock()
+        await self.cog.narrate_clone.callback(self.cog, ctx, "delete", name="melon, sleepy")
+        self.cog.fish.delete_model.assert_awaited_once_with("aaa")
+        sqls = [c.args for c in db.execute.await_args_list]
+        self.assertTrue(any("DELETE FROM tts_designed_voices" in a[0] for a in sqls))
+        reset = next(a for a in sqls if "UPDATE narrate_prefs" in a[0])
+        self.assertNotIn("user_id", reset[0])                  # everyone, since it's public
+        self.assertEqual(reset[1:], ("fish:aaa",))
+        self.assertIn("Deleted", ctx.send.await_args.args[0])
+
     def test_bot_commands_are_not_narrated(self):
         bot = Mock(command_prefix="!")
         bot.get_command = lambda name: Mock() if name.lower() in {"quota", "narrate", "rate"} else None
