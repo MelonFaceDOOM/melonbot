@@ -14,6 +14,7 @@ config.FISH_DEFAULT_VOICE_ID = ""
 config.FISH_MODEL = "s2.1-pro"
 config.GEMINI_MODEL = "gemini-3.8-flash-tts"
 config.GEMINI_RPM = 9
+config.GEMINI_FALLBACK_MODELS = ()
 config.TTS_MONTHLY_BUDGET_USD = 10.0
 with patch.dict(sys.modules, {"config": config}):
     import bot_narrate

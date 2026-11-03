@@ -16,6 +16,7 @@ config.FISH_DEFAULT_VOICE_ID = ""
 config.FISH_MODEL = "s2.1-pro"
 config.GEMINI_MODEL = "gemini-3.8-flash-tts"
 config.GEMINI_RPM = 9
+config.GEMINI_FALLBACK_MODELS = ()
 config.TTS_MONTHLY_BUDGET_USD = 10.0
 with patch.dict(sys.modules, {"config": config}):
     import bot_narrate
@@ -148,16 +149,16 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         db.execute = AsyncMock()
         self.bot.db_pool = db
         self.assertFalse(await self.cog._over_user_share(7))
-        await self.cog._add_user_spend(7, 0.02)
+        await self.cog._add_spend(1, 7, 0.02)
         self.assertTrue(await self.cog._over_user_share(7))   # 5.01 >= half of $10
-        db.execute.assert_awaited_once()
+        self.assertEqual(db.execute.await_count, 2)           # user row + server row
         self.assertEqual(db.fetchrow.await_count, 1)          # cached after the first read
 
     async def test_synth_cost_is_charged_to_the_user(self):
         self.cog.router.synth.return_value = SynthResult(OGG, "ogg_opus", "fish", None, 0.003)
-        self.cog._add_user_spend = AsyncMock()
+        self.cog._add_spend = AsyncMock()
         await self.narrate()
-        self.cog._add_user_spend.assert_awaited_once_with(2, 0.003)
+        self.cog._add_spend.assert_awaited_once_with(1, 2, 0.003)
 
     async def test_user_over_share_gets_google_voice(self):
         self.cog._get_pref.return_value = {"enabled": True, "text_channel_id": 5,
@@ -175,6 +176,31 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         item = self.cog._enqueue_narration.call_args.args[1]
         self.assertEqual(item[2], bot_narrate.DEFAULT_GOOGLE_VOICE)
         self.cog._notify_fallback.assert_awaited_once()
+
+    async def test_quota_shows_user_server_and_shared_budget(self):
+        self.cog._user_spent = AsyncMock(return_value=1.25)
+        self.cog._guild_spent = AsyncMock(return_value=3.5)
+        self.cog.budget.spent = AsyncMock(return_value=4.0)
+        ctx = Mock()
+        ctx.send = AsyncMock()
+        await self.cog.quota.callback(self.cog, ctx)
+        embed = ctx.send.await_args.kwargs["embed"]
+        values = {f.name: f.value for f in embed.fields}
+        self.assertIn("$1.25 of your $5.00 limit", values["You"])
+        self.assertIn("$3.50", values["This server"])
+        self.assertIn("$4.00 of $10.00", values["Shared budget (all servers)"])
+        self.assertIn("40%", values["Shared budget (all servers)"])
+
+    async def test_quota_when_db_is_down(self):
+        self.cog._user_spent = AsyncMock(return_value=0.0)
+        self.cog._guild_spent = AsyncMock(return_value=None)
+        self.cog.budget.spent = AsyncMock(return_value=float("inf"))
+        ctx = Mock()
+        ctx.send = AsyncMock()
+        await self.cog.quota.callback(self.cog, ctx)
+        values = {f.name: f.value for f in ctx.send.await_args.kwargs["embed"].fields}
+        self.assertIn("unavailable", values["This server"])
+        self.assertIn("unavailable", values["Shared budget (all servers)"])
 
     async def test_voices_embed(self):
         self.cog.fish, self.cog.gemini = Mock(), Mock()

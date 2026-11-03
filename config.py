@@ -115,8 +115,13 @@ gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
 FISH_DEFAULT_VOICE_ID = os.environ.get("FISH_DEFAULT_VOICE_ID", "").strip()
 FISH_MODEL = os.environ.get("FISH_MODEL", "s2.1-pro").strip() or "s2.1-pro"
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash-tts").strip() or "gemini-3.8-flash-tts"
+# Tried in order once GEMINI_MODEL hits its (per-model) quota; empty string disables the chain
+GEMINI_FALLBACK_MODELS = tuple(m.strip() for m in os.environ.get(
+    "GEMINI_FALLBACK_MODELS",
+    "gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts,gemini-2.5-pro-preview-tts",
+).split(",") if m.strip())
 GEMINI_RPM = int(os.environ.get("GEMINI_RPM", "9") or 9)
-TTS_MONTHLY_BUDGET_USD = float(os.environ.get("TTS_MONTHLY_BUDGET_USD", "10") or 10)
+TTS_MONTHLY_BUDGET_USD = float(os.environ.get("TTS_MONTHLY_BUDGET_USD", "20") or 20)
 
 SFTP_CREDENTIALS = {
     "host": os.environ.get("SFTP_HOST", ""),

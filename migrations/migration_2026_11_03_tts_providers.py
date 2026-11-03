@@ -3,6 +3,7 @@ Multi-provider narration (Fish / Gemini / Google):
 - narrate_prefs.voice_label, narrate_prefs.style
 - tts_usage: month-to-date estimated spend per paid provider (budget cap)
 - tts_user_usage: month-to-date estimated spend per user (one user may use at most half the budget)
+- tts_guild_usage: month-to-date estimated spend per server (shown by !quota)
 - tts_designed_voices: voices users created with `!narrate design`
 """
 
@@ -37,6 +38,14 @@ DDL = [
         user_id  BIGINT NOT NULL,
         est_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
         PRIMARY KEY (month, user_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS tts_guild_usage (
+        month    DATE NOT NULL,
+        guild_id BIGINT NOT NULL,
+        est_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
+        PRIMARY KEY (month, guild_id)
     )
     """,
     """

@@ -123,6 +123,11 @@ def make_db():
                 user_id  BIGINT NOT NULL,
                 est_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
                 PRIMARY KEY (month, user_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS tts_guild_usage (
+                month    DATE NOT NULL,
+                guild_id BIGINT NOT NULL,
+                est_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
+                PRIMARY KEY (month, guild_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS tts_designed_voices (
                 id          BIGSERIAL PRIMARY KEY,
                 guild_id    BIGINT NOT NULL,

@@ -5,13 +5,13 @@ import time
 import io
 import math
 import subprocess
-from datetime import date
+from datetime import date, timedelta
 from typing import Optional, Dict, Tuple, List, Union
 import discord
 from discord.ext import commands
 from config import (
     google_narrate_key, fish_api_key, gemini_api_key, FISH_DEFAULT_VOICE_ID, FISH_MODEL,
-    GEMINI_MODEL, GEMINI_RPM, TTS_MONTHLY_BUDGET_USD,
+    GEMINI_MODEL, GEMINI_FALLBACK_MODELS, GEMINI_RPM, TTS_MONTHLY_BUDGET_USD,
 )
 from bot_helpers import get_user_id, get_guild_id
 from db_mixin import DbMixin
@@ -60,6 +60,8 @@ FALLBACK_NOTICES = {
     "balance": ("The Fish Audio credit has run out, so narration is using the free Google voice until it's topped up.", None),
     "not_configured": ("That voice's provider isn't set up on this bot, so narration is using the Google voice.", None),
     "rate_limited": ("The voice service is rate limiting right now, so some messages used the Google voice.", 3600),
+    "gemini_limit": ("Gemini voices have hit their usage limit for now, so they're using the default Fish voice "
+                     "(or Google) until it resets.", 6 * 3600),
     "error": ("The selected voice failed, so that message used the Google voice instead.", 3600),
     "user_quota": ("Someone here has used their share of this month's premium-voice budget, so their messages use the Google voice until next month.", 3600),
 }
@@ -149,6 +151,12 @@ def _short_voice_name(voice_name: str) -> str:
     #   ar-XA-Chirp3-HD-Achernar   -> Chirp3-HD-Achernar
     parts = voice_name.split("-", 2)
     return parts[2] if len(parts) >= 3 else voice_name
+
+def _usd_bar(spent: float, cap: float, width: int = 12) -> str:
+    """Text progress bar like '███░░░░░░░░░ 24%'."""
+    frac = 0.0 if cap <= 0 else min(1.0, max(0.0, spent / cap))
+    filled = round(frac * width)
+    return f"`{'█' * filled}{'░' * (width - filled)}` {frac:.0%}"
 
 def _voice_display(voice_ref: str, label: Optional[str]) -> str:
     """Human-readable voice for status lines: 'Label (Fish)' / 'Label (Gemini)' / Google name."""
@@ -504,10 +512,12 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         self.bot = bot
         self.tts = GoogleTTSProvider(google_narrate_key)
         self.fish = FishTTSProvider(fish_api_key, FISH_MODEL) if fish_api_key else None
-        self.gemini = GeminiTTSProvider(gemini_api_key, GEMINI_MODEL, GEMINI_RPM) if gemini_api_key else None
+        self.gemini = (GeminiTTSProvider(gemini_api_key, GEMINI_MODEL, GEMINI_RPM, GEMINI_FALLBACK_MODELS)
+                       if gemini_api_key else None)
         self.budget = BudgetTracker(lambda: self.db, TTS_MONTHLY_BUDGET_USD)
         self.router = TTSRouter(self.tts, self.fish, self.gemini, self.budget,
-                                reference_loader=self._load_designed_sample)
+                                reference_loader=self._load_designed_sample,
+                                fish_standin_voice=DEFAULT_VOICE[len("fish:"):] if DEFAULT_VOICE.startswith("fish:") else None)
         self.guild_sessions: Dict[int, GuildVoiceSession] = {}
         # One queue + worker per guild, so a busy guild can't hold up the others.
         # Items: (user_id, text, voice ref, style, rate, channel_id, session generation)
@@ -615,7 +625,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         self._user_spend[user_id] = (month, usd)
         return usd
 
-    async def _add_user_spend(self, user_id: int, usd: float) -> None:
+    async def _add_spend(self, guild_id: int, user_id: int, usd: float) -> None:
+        """Charge paid-voice spend to the user (for their share cap) and the server (for !quota)."""
         if usd <= 0:
             return
         month = BudgetTracker.current_month()
@@ -628,8 +639,25 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 """,
                 month, user_id, round(usd, 6),
             )
+            await self.db.execute(
+                """
+                INSERT INTO tts_guild_usage (month, guild_id, est_usd) VALUES ($1, $2, $3)
+                ON CONFLICT (month, guild_id) DO UPDATE SET est_usd = tts_guild_usage.est_usd + EXCLUDED.est_usd
+                """,
+                month, guild_id, round(usd, 6),
+            )
         except Exception as e:
-            print(f"[narrate] failed to record user spend: {e}")
+            print(f"[narrate] failed to record spend: {e}")
+
+    async def _guild_spent(self, guild_id: int) -> Optional[float]:
+        try:
+            row = await self.db.fetchrow(
+                "SELECT est_usd FROM tts_guild_usage WHERE month=$1 AND guild_id=$2",
+                BudgetTracker.current_month(), guild_id)
+        except Exception as e:
+            print(f"[narrate] failed to load server spend: {e}")
+            return None
+        return float(row["est_usd"]) if row else 0.0
 
     async def _over_user_share(self, user_id: int) -> bool:
         return await self._user_spent(user_id) >= self.budget.cap * USER_BUDGET_SHARE
@@ -1077,6 +1105,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "  !narrate designs                    (your designed voices)\n"
             "  !narrate rate <float>\n"
             "  !narrate usage                      (this month's TTS spend)\n"
+            "  !quota                              (your + this server's premium-voice spend)\n"
             "  !narrate save <voiceline-name>      (saves your most recently narrated audio)\n"
             "  !narrate list                       (lists saved voicelines for this server)\n"
             "  !narrate rename <old> <new>\n"
@@ -1087,7 +1116,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "and use [laugh] [sigh] [gasp] [pause] anywhere (Fish & Gemini voices only)."
         )
         # Show the prefix this bot actually uses (dev runs with '?')
-        await ctx.send(usage.replace("!narrate", f"{ctx.clean_prefix}narrate"), suppress_embeds=True)
+        usage = usage.replace("!narrate", f"{ctx.clean_prefix}narrate").replace("!quota", f"{ctx.clean_prefix}quota")
+        await ctx.send(usage, suppress_embeds=True)
 
     @narrate_root.command(name="on", aliases=["start"])
     async def narrate_on(self, ctx: commands.Context):
@@ -1135,8 +1165,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             embed.add_field(
                 name="🐟 Fish Audio · default",
                 value=(f"⚡ **Fast** (~1–2 s) · 🎭 expressive · 📚 huge community library: characters, accents, memes\n"
-                       f"[Browse voices]({FISH_LIBRARY_URL}), open one, copy its link\n"
-                       f"`{p} voice <link>`"),
+                       f"[Browse voices]({FISH_LIBRARY_URL}), open one, copy its link or ID\n"
+                       f"`{p} voice <link or ID>`"),
                 inline=False,
             )
         if self.gemini:
@@ -1398,6 +1428,32 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         await ctx.send(f"Default style set to **{style[:200]}**{note}. Starting a message with `[...]` overrides it.",
                        suppress_embeds=True)
 
+    @commands.command(name="quota")
+    async def quota(self, ctx: commands.Context):
+        """Your and this server's premium-voice (Fish/Gemini) spend this month."""
+        if not ctx.guild:
+            return await ctx.send("Run this in a server.")
+        month = BudgetTracker.current_month()
+        user_cap = self.budget.cap * USER_BUDGET_SHARE
+        mine = await self._user_spent(ctx.author.id)
+        server = await self._guild_spent(ctx.guild.id)
+        total = await self.budget.spent()
+
+        embed = discord.Embed(title=f"📊 Premium voice usage · {month:%B %Y}", color=VOICES_EMBED_COLOR)
+        embed.add_field(name="You", value=f"{_usd_bar(mine, user_cap)}\n${mine:.2f} of your ${user_cap:.2f} limit",
+                        inline=False)
+        embed.add_field(name="This server",
+                        value="unavailable right now" if server is None else f"${server:.2f} this month",
+                        inline=False)
+        embed.add_field(name="Shared budget (all servers)",
+                        value=("unavailable right now (paid voices paused)" if total == float("inf")
+                               else f"{_usd_bar(total, self.budget.cap)}\n${total:.2f} of ${self.budget.cap:.2f}"),
+                        inline=False)
+        next_month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+        embed.set_footer(text=f"Resets {next_month:%b} 1. Google voices are free and don't count. "
+                              f"Past your limit, your messages use the Google voice.")
+        await ctx.send(embed=embed)
+
     @narrate_root.command(name="usage")
     @commands.has_permissions(manage_guild=True)
     async def narrate_usage(self, ctx: commands.Context):
@@ -1447,7 +1503,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 print(f"[narrate] voice design failed: {e}")
                 return await ctx.send("Voice design failed; try a different description.", suppress_embeds=True)
         await self.budget.record("fish", FISH_VOICE_DESIGN_USD)
-        await self._add_user_spend(ctx.author.id, FISH_VOICE_DESIGN_USD)
+        await self._add_spend(ctx.guild.id, ctx.author.id, FISH_VOICE_DESIGN_USD)
         candidates = [c for c in candidates if c.get("audio")]
         if not candidates:
             return await ctx.send("Fish didn't return any voices for that; try rewording it.", suppress_embeds=True)
@@ -1909,7 +1965,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                     await self._notify_fallback(guild, channel_id, res.fallback_reason)
                 if session.generation != gen:
                     return
-                await self._add_user_spend(user_id, res.cost_usd)
+                await self._add_spend(guild_id, user_id, res.cost_usd)
                 clips.append((res.audio, res.fmt))
                 await session.enqueue(res.audio)
         except Exception as e:
