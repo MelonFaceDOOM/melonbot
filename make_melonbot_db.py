@@ -118,6 +118,11 @@ def make_db():
                 audio_ms  BIGINT NOT NULL DEFAULT 0,
                 est_usd   NUMERIC(12,6) NOT NULL DEFAULT 0,
                 PRIMARY KEY (month, provider))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS tts_user_usage (
+                month    DATE NOT NULL,
+                user_id  BIGINT NOT NULL,
+                est_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
+                PRIMARY KEY (month, user_id))""")
     cur.execute("""CREATE TABLE IF NOT EXISTS tts_designed_voices (
                 id          BIGSERIAL PRIMARY KEY,
                 guild_id    BIGINT NOT NULL,

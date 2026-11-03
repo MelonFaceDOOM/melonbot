@@ -138,6 +138,7 @@ Adds Fish Audio and Gemini TTS alongside Google for `!narrate`:
 
 - `narrate_prefs.voice_label` (display name for Fish/Gemini voices), `narrate_prefs.style` (default delivery style)
 - `tts_usage` — month-to-date estimated spend per paid provider; narration falls back to Google once the shared `TTS_MONTHLY_BUDGET_USD` cap is reached
+- `tts_user_usage` — month-to-date estimated spend per user; one user can use at most half the cap before their messages fall back to Google
 - `tts_designed_voices` — voices created with `!narrate design`
 
 `narrate_prefs.voice` now holds a voice ref: `fish:<model id>`, `gemini:<voice id>`, or a Google voice name (unchanged, so existing prefs keep working).

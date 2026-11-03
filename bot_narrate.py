@@ -3,6 +3,7 @@ import asyncpg
 from pathlib import Path
 import time
 import io
+import math
 import subprocess
 from datetime import date
 from typing import Optional, Dict, Tuple, List, Union
@@ -20,7 +21,7 @@ from tts_providers import (
     DEFAULT_GOOGLE_VOICE, DEFAULT_LANG, DEFAULT_RATE, FISH_REF_PREFIX, FISH_VOICE_DESIGN_USD, ProviderError,
     audio_format, extract_fish_id, parse_voice_ref,
 )
-from tts_text import split_leading_style
+from tts_text import chunk_for_speech, split_leading_style
 import re
 import uuid
 import os
@@ -29,8 +30,14 @@ import tempfile
 # ==========================
 # Tuning knobs & feature flags
 # ==========================
-MAX_CHARS_PER_CHUNK = 180                  # small chunks → faster time-to-first-audio (Google)
-NARRATE_WORKERS = 4                        # will reduce lag if multiple guilds are narrating
+GUILD_BACKLOG = 20                         # queued messages per guild; more are dropped
+# Limits only exist to catch abuse; normal chat shouldn't come near any of them.
+MAX_NARRATE_CHARS = 1500                   # longer messages are cut off (~1m50s of speech)
+USER_BURST_CHARS = 4000                    # per-user token bucket: burst size...
+USER_REFILL_CHARS_PER_SEC = 2000 / 60      # ...and refill: 2000 chars/min, ~2.4x faster than speech plays
+USER_BUDGET_SHARE = 0.5                    # one user may spend at most this share of the monthly budget
+SELF_DISCONNECT_GRACE_SECS = 15            # voice-state events this soon after our own disconnect aren't kicks
+RATE_MIN, RATE_MAX = 0.25, 4.0
 PLAYBACK_IDLE_DISCONNECT_SECS = 3600       # leave VC when idle
 # Voice ref for users who haven't picked one; existing Google picks are left alone.
 DEFAULT_VOICE = f"fish:{FISH_DEFAULT_VOICE_ID.lower()}" if (FISH_DEFAULT_VOICE_ID and fish_api_key) else DEFAULT_GOOGLE_VOICE
@@ -51,8 +58,9 @@ FALLBACK_NOTICES = {
     "budget": ("This month's TTS budget is used up, so narration is using the free Google voice until next month.", None),
     "balance": ("The Fish Audio credit has run out, so narration is using the free Google voice until it's topped up.", None),
     "not_configured": ("That voice's provider isn't set up on this bot, so narration is using the Google voice.", None),
-    "rate_limited": ("Gemini is rate limiting right now, so some messages used the Google voice.", 3600),
+    "rate_limited": ("The voice service is rate limiting right now, so some messages used the Google voice.", 3600),
     "error": ("The selected voice failed, so that message used the Google voice instead.", 3600),
+    "user_quota": ("Someone here has used their share of this month's premium-voice budget, so their messages use the Google voice until next month.", 3600),
 }
 
 
@@ -148,25 +156,6 @@ def _voice_display(voice_ref: str, label: Optional[str]) -> str:
         return f"{voice_ref} ({label})" if label else voice_ref
     return f"{label or voice_ref} ({'Fish' if provider == 'fish' else 'Gemini'})"
 
-def chunk_text(text: str, limit: int = MAX_CHARS_PER_CHUNK) -> List[str]:
-    text = text.strip()
-    if len(text) <= limit:
-        return [text] if text else []
-    chunks, cur = [], []
-    cur_len = 0
-    tokens = text.split()
-    for tok in tokens:
-        add_len = len(tok) + (1 if cur else 0)
-        if cur_len + add_len > limit:
-            chunks.append(" ".join(cur))
-            cur, cur_len = [tok], len(tok)
-        else:
-            cur.append(tok)
-            cur_len += add_len
-    if cur:
-        chunks.append(" ".join(cur))
-    return chunks
-
 
 ### VOICELINE SAVE/LOAD HELPERS ###
 
@@ -191,6 +180,22 @@ def _atomic_write_bytes(dest_path: Path, data: bytes) -> None:
                 os.remove(tmp_path)
         except Exception:
             pass
+
+def _join_to_ogg_opus(clips: List[bytes]) -> bytes:
+    """Concatenate clips (any mix of OGG/WAV, sample rates) into one OGG/Opus file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        args = [FFMPEG_BIN, "-nostdin", "-loglevel", "error"]
+        for i, clip in enumerate(clips):
+            path = os.path.join(tmp, f"{i}.bin")
+            with open(path, "wb") as f:
+                f.write(clip)
+            args += ["-i", path]
+        n = len(clips)
+        graph = "".join(f"[{i}:a]aresample=48000,aformat=channel_layouts=mono[a{i}];" for i in range(n))
+        graph += "".join(f"[a{i}]" for i in range(n)) + f"concat=n={n}:v=0:a=1[out]"
+        args += ["-filter_complex", graph, "-map", "[out]", "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1"]
+        return subprocess.run(args, capture_output=True, check=True).stdout
+
 
 def _transcode_to_ogg_opus(audio: bytes) -> bytes:
     """Gemini returns WAV; voicelines are stored as OGG/Opus like everything else."""
@@ -224,10 +229,21 @@ class GuildVoiceSession():
         self.idle_task: Optional[asyncio.Task] = None
         self.lock = asyncio.Lock()
         self.last_activity = time.monotonic()
+        # Bumped by cancel/teardown; queued work stamped with an older value is dropped.
+        self.generation = 0
+        # When we last disconnected on purpose (recycle), so the voice-state echo isn't treated as a kick.
+        self.self_disconnect_at = 0.0
+
+    def recently_self_disconnected(self) -> bool:
+        return time.monotonic() - self.self_disconnect_at < SELF_DISCONNECT_GRACE_SECS
 
     # ---------- enqueue ----------
     async def enqueue(self, audio_bytes: bytes):
-        await self.queue.put(audio_bytes)
+        try:
+            self.queue.put_nowait(audio_bytes)
+        except asyncio.QueueFull:
+            print(f"[narrate] playback queue full, dropping clip: guild={self.guild_id}")
+            return
         self.last_activity = time.monotonic()
 
     # ---------- connection & lifecycle ----------
@@ -236,6 +252,12 @@ class GuildVoiceSession():
             # Sessions survive disconnects and can exist long before the first join.
             # Claiming a channel is activity, even if no narration follows it.
             self.last_activity = time.monotonic()
+            if not (self.voice_client and self.voice_client.is_connected()):
+                # discord.py may still hold a connection we lost track of (or is reconnecting it);
+                # connect() would raise "Already connected", so adopt it instead.
+                existing = getattr(channel.guild, "voice_client", None)
+                if isinstance(existing, discord.VoiceClient):
+                    self.voice_client = existing
             if self.voice_client and self.voice_client.is_connected():
                 if self.voice_client.channel.id != channel.id:
                     await self.voice_client.move_to(channel)
@@ -247,7 +269,8 @@ class GuildVoiceSession():
             self._ensure_idle_timer()
             
     async def cancel_playback(self):
-        """Stop current audio and clear the queue for this guild."""
+        """Stop current audio, clear the queue, and drop narration already queued for synthesis."""
+        self.generation += 1
         if self.voice_client and self.voice_client.is_connected() and self.voice_client.is_playing():
             try:
                 self.voice_client.stop()
@@ -296,10 +319,11 @@ class GuildVoiceSession():
 
         source = None
         done = asyncio.Event()
+        loop = asyncio.get_running_loop()
 
         def _after(_err):
-            # discord.py calls this on natural end or on stop()
-            done.set()
+            # discord.py calls this from its audio thread on natural end or on stop()
+            loop.call_soon_threadsafe(done.set)
 
         try:
             source = discord.FFmpegPCMAudio(
@@ -335,6 +359,7 @@ class GuildVoiceSession():
     async def _recycle_voice_connection(self, reason: str):
         print(f"[narrate] recycling voice connection: {reason}")
         vc = self.voice_client
+        self.self_disconnect_at = time.monotonic()
         try:
             if vc and vc.is_connected():
                 try:
@@ -364,6 +389,12 @@ class GuildVoiceSession():
             raise
 
     async def teardown(self):
+        # Same lock as ensure_connected, so a connect can't land in the middle of a teardown.
+        async with self.lock:
+            await self._teardown_locked()
+
+    async def _teardown_locked(self):
+        self.generation += 1
         vc = self.voice_client
         try:
             try:
@@ -477,17 +508,18 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         self.router = TTSRouter(self.tts, self.fish, self.gemini, self.budget,
                                 reference_loader=self._load_designed_sample)
         self.guild_sessions: Dict[int, GuildVoiceSession] = {}
-        # guild_id, user_id, text_to_narrate, voice ref, style, rate, channel
-        self._narrate_queue: asyncio.Queue[tuple[int, int, str, str, Optional[str], float, int]] = asyncio.Queue()
-        self._guild_locks: Dict[int, asyncio.Lock] = {}
-        self._workers: list[asyncio.Task] = [
-            asyncio.create_task(self._narrate_worker(), name=f"narrate:{i}")
-            for i in range(NARRATE_WORKERS)
-        ]
+        # One queue + worker per guild, so a busy guild can't hold up the others.
+        # Items: (user_id, text, voice ref, style, rate, channel_id, session generation)
+        self._guild_queues: Dict[int, asyncio.Queue] = {}
+        self._guild_workers: Dict[int, asyncio.Task] = {}
+        # user_id -> (tokens, last refill time) for the per-user narration rate limit
+        self._user_buckets: Dict[int, Tuple[float, float]] = {}
+        # user_id -> (month, est. USD) of paid-voice spend; persisted in tts_user_usage
+        self._user_spend: Dict[int, Tuple[date, float]] = {}
         self.guild_voiceline_caches: Dict[int, Dict[str, str]] = {}
         self.persistent_audio_root = "data/audio"
-        # (guild_id, user_id) -> (audio bytes, format) of the most recent clip, for !narrate save
-        self._last_narrated_audio: Dict[Tuple[int, int], Tuple[bytes, str]] = {}
+        # (guild_id, user_id) -> clips [(audio bytes, format)] of the most recent message, for !narrate save
+        self._last_narrated_audio: Dict[Tuple[int, int], List[Tuple[bytes, str]]] = {}
         # (guild_id, reason) -> (month, monotonic time) of the last fallback notice
         self._fallback_notices: Dict[Tuple[int, str], Tuple[date, float]] = {}
         self._design_last_used: Dict[int, float] = {}
@@ -500,7 +532,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
     def cog_unload(self):
         # Cancel background narrate workers immediately.
-        for t in getattr(self, "_workers", []):
+        workers = list(getattr(self, "_guild_workers", {}).values())
+        for t in workers:
             try:
                 if not t.done():
                     t.cancel()
@@ -510,10 +543,10 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         async def _cleanup():
             # Wait for workers to finish cancelling.
             try:
-                await asyncio.gather(*[t for t in getattr(self, "_workers", [])], return_exceptions=True)
+                await asyncio.gather(*workers, return_exceptions=True)
             except Exception:
                 pass
-            self._workers = []
+            self._guild_workers.clear()
             try:
                 await asyncio.gather(
                     *[sess.teardown() for sess in list(self.guild_sessions.values())],
@@ -521,14 +554,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 )
             finally:
                 self.guild_sessions.clear()
-            q = getattr(self, "_narrate_queue", None)
-            if q is not None:
-                try:
-                    while True:
-                        q.get_nowait()
-                        q.task_done()
-                except asyncio.QueueEmpty:
-                    pass
+            self._guild_queues.clear()
             try:
                 await self.router.close()
             except Exception:
@@ -539,11 +565,65 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         except Exception:
             asyncio.create_task(_cleanup())
 
-    def _guild_lock(self, guild_id: int) -> asyncio.Lock:
-        lock = self._guild_locks.get(guild_id)
-        if lock is None:
-            lock = self._guild_locks[guild_id] = asyncio.Lock()
-        return lock
+    def _enqueue_narration(self, guild_id: int, item: tuple) -> bool:
+        q = self._guild_queues.get(guild_id)
+        if q is None:
+            q = self._guild_queues[guild_id] = asyncio.Queue(maxsize=GUILD_BACKLOG)
+        worker = self._guild_workers.get(guild_id)
+        if worker is None or worker.done():
+            self._guild_workers[guild_id] = asyncio.create_task(self._guild_worker(guild_id, q), name=f"narrate:{guild_id}")
+        try:
+            q.put_nowait(item)
+            return True
+        except asyncio.QueueFull:
+            print(f"[narrate] backlog full, dropping message: guild={guild_id}")
+            return False
+
+    def _take_rate_tokens(self, user_id: int, chars: int) -> bool:
+        """Per-user token bucket in characters; False = over the limit, drop the message."""
+        now = time.monotonic()
+        tokens, last = self._user_buckets.get(user_id, (float(USER_BURST_CHARS), now))
+        tokens = min(float(USER_BURST_CHARS), tokens + (now - last) * USER_REFILL_CHARS_PER_SEC)
+        if tokens < chars:
+            self._user_buckets[user_id] = (tokens, now)
+            return False
+        self._user_buckets[user_id] = (tokens - chars, now)
+        return True
+
+    async def _user_spent(self, user_id: int) -> float:
+        """This month's estimated paid-voice spend for a user (0 if the DB can't say; the global cap still applies)."""
+        month = BudgetTracker.current_month()
+        cached = self._user_spend.get(user_id)
+        if cached and cached[0] == month:
+            return cached[1]
+        try:
+            row = await self.db.fetchrow(
+                "SELECT est_usd FROM tts_user_usage WHERE month=$1 AND user_id=$2", month, user_id)
+        except Exception as e:
+            print(f"[narrate] failed to load user spend: {e}")
+            return 0.0
+        usd = float(row["est_usd"]) if row else 0.0
+        self._user_spend[user_id] = (month, usd)
+        return usd
+
+    async def _add_user_spend(self, user_id: int, usd: float) -> None:
+        if usd <= 0:
+            return
+        month = BudgetTracker.current_month()
+        self._user_spend[user_id] = (month, await self._user_spent(user_id) + usd)
+        try:
+            await self.db.execute(
+                """
+                INSERT INTO tts_user_usage (month, user_id, est_usd) VALUES ($1, $2, $3)
+                ON CONFLICT (month, user_id) DO UPDATE SET est_usd = tts_user_usage.est_usd + EXCLUDED.est_usd
+                """,
+                month, user_id, round(usd, 6),
+            )
+        except Exception as e:
+            print(f"[narrate] failed to record user spend: {e}")
+
+    async def _over_user_share(self, user_id: int) -> bool:
+        return await self._user_spent(user_id) >= self.budget.cap * USER_BUDGET_SHARE
 
     def _get_session(self, guild_id: int) -> GuildVoiceSession:
         sess = self.guild_sessions.get(guild_id)
@@ -1025,7 +1105,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     @narrate_root.command(name="cancel", aliases=["x"])
     async def narrate_cancel(self, ctx: commands.Context):
         session = self._get_session(ctx.guild.id)
-        await session.cancel_playback()
+        await session.cancel_playback()  # also drops messages still waiting to be synthesized
         await ctx.send("⏹️ Stopped current narration.")
 
     @narrate_root.command(name="voices")
@@ -1066,8 +1146,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if gender_in:
             sql += " AND gender = $2"
             params.append(gender_in)
-
-            sql += " ORDER BY nickname"
+        sql += " ORDER BY nickname"
 
         rows = await self.db.fetch(sql, *params)
         if not rows:
@@ -1129,7 +1208,15 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 style_str = f" | style: {r['style']}" if r["style"] else ""
                 lines.append(f"- {username} | {v} | {rate_str}{style_str}")
 
-        await ctx.send("\n".join(lines), suppress_embeds=True)
+        # Several users with long styles can pass Discord's 2000-char limit
+        buf = ""
+        for line in lines:
+            if buf and len(buf) + 1 + len(line) > 1900:
+                await ctx.send(buf, suppress_embeds=True)
+                buf = ""
+            buf = f"{buf}\n{line}" if buf else line[:1900]
+        if buf:
+            await ctx.send(buf, suppress_embeds=True)
 
     @narrate_root.command(name="channel")
     async def narrate_channel(self, ctx: commands.Context, channel: Optional[Union[discord.TextChannel, discord.Thread]] = None):
@@ -1146,8 +1233,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         # A locally kept designed voice: fish:ref:<key> (from !narrate designs)
         if low.startswith(f"fish:{FISH_REF_PREFIX}"):
             row = await self.db.fetchrow(
-                "SELECT title FROM tts_designed_voices WHERE provider='fish' AND voice_id=$1",
-                low[len("fish:"):],
+                "SELECT title FROM tts_designed_voices WHERE provider='fish' AND voice_id=$1 AND guild_id=$2",
+                low[len("fish:"):], ctx.guild.id,
             )
             if not row:
                 return await ctx.send("No designed voice with that id. `!narrate designs` lists yours.", suppress_embeds=True)
@@ -1179,7 +1266,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             """
             SELECT language, voice_name, gender, nickname
             FROM google_tts_voices
-            WHERE voice_name ILIKE $1
+            WHERE lower(voice_name) = lower($1)
             LIMIT 1
             """,
             q,
@@ -1191,7 +1278,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 """
                 SELECT language, voice_name, gender, nickname
                 FROM google_tts_voices
-                WHERE nickname ILIKE $1
+                WHERE lower(nickname) = lower($1)
                 LIMIT 1
                 """,
                 q,
@@ -1270,7 +1357,11 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     @narrate_root.command(name="usage")
     @commands.has_permissions(manage_guild=True)
     async def narrate_usage(self, ctx: commands.Context):
-        totals = await self.budget.by_provider()
+        try:
+            totals = await self.budget.by_provider()
+        except RuntimeError:
+            return await ctx.send("Can't read usage right now (database unreachable); paid voices are paused until it is.",
+                                  suppress_embeds=True)
         spent = sum(totals.values())
         lines = [f"**TTS spend this month:** ${spent:.2f} of ${self.budget.cap:.2f} (estimated, all servers)"]
         for prov, usd in sorted(totals.items()):
@@ -1296,6 +1387,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if await self.budget.exhausted():
             return await ctx.send("This month's TTS budget is used up, so voice design is off until next month.",
                                   suppress_embeds=True)
+        if await self._over_user_share(ctx.author.id):
+            return await ctx.send("You've used your share of this month's premium-voice budget, so voice design is off "
+                                  "for you until next month.", suppress_embeds=True)
         guild_id = await get_guild_id(ctx, self.db)
         user_id = await get_user_id(ctx, self.db)
         if guild_id is None or user_id is None:
@@ -1309,6 +1403,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 print(f"[narrate] voice design failed: {e}")
                 return await ctx.send("Voice design failed; try a different description.", suppress_embeds=True)
         await self.budget.record("fish", FISH_VOICE_DESIGN_USD)
+        await self._add_user_spend(ctx.author.id, FISH_VOICE_DESIGN_USD)
         candidates = [c for c in candidates if c.get("audio")]
         if not candidates:
             return await ctx.send("Fish didn't return any voices for that; try rewording it.", suppress_embeds=True)
@@ -1417,6 +1512,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         voice      = (pref.get("voice") if pref else None) or DEFAULT_VOICE
         enabled    = bool(pref.get("enabled")) if pref else False
         rate_val   = float(rate)
+        if not math.isfinite(rate_val) or not (RATE_MIN <= rate_val <= RATE_MAX):
+            return await ctx.send(f"Rate must be between {RATE_MIN} and {RATE_MAX} (1.0 is normal).", suppress_embeds=True)
+        rate_val = round(rate_val, 2)
 
         await self._upsert_pref(ctx, channel_id, voice, rate_val, enabled)
         await ctx.send(f"Speaking rate set to `{rate_val}`.", suppress_embeds=True)
@@ -1442,6 +1540,10 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             bot_was_in_vc = before.channel is not None
             bot_now_out   = after.channel is None
             if bot_was_in_vc and bot_now_out:
+                session = self._get_session(guild.id)
+                if session.recently_self_disconnected():
+                    # Our own recycle after a voice error; the next message reconnects. Not a kick.
+                    return
                 try:
                     await self._set_all_prefs_disabled(guild.id)
                 except Exception as e:
@@ -1533,13 +1635,25 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if not cleaned:
             return
 
+        if len(cleaned) > MAX_NARRATE_CHARS:
+            cut = cleaned[:MAX_NARRATE_CHARS]
+            cleaned = cut[:cut.rfind(" ")] if " " in cut[MAX_NARRATE_CHARS // 2:] else cut
+        if not self._take_rate_tokens(message.author.id, len(cleaned)):
+            return  # talking faster than anyone can listen; drop rather than build a backlog
+
         voice = (pref.get("voice") or DEFAULT_VOICE)
         style = msg_style or pref.get("style")
         try:
             rate = float(pref.get("rate") if pref.get("rate") is not None else DEFAULT_RATE)
         except Exception:
             rate = DEFAULT_RATE
-        await self._narrate_queue.put((message.guild.id, message.author.id, cleaned, voice, style, rate, message.channel.id))
+        if not math.isfinite(rate) or not (RATE_MIN <= rate <= RATE_MAX):
+            rate = DEFAULT_RATE
+        if parse_voice_ref(voice)[0] != "google" and await self._over_user_share(message.author.id):
+            voice = DEFAULT_GOOGLE_VOICE
+            await self._notify_fallback(message.guild, message.channel.id, "user_quota")
+        gen = self._get_session(message.guild.id).generation
+        self._enqueue_narration(message.guild.id, (message.author.id, cleaned, voice, style, rate, message.channel.id, gen))
 
     @narrate_root.command(name="save")
     async def narrate_save(self, ctx: commands.Context, *, voiceline_name: str):
@@ -1554,10 +1668,11 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 "No recent narrated audio found for you in this server.",
                 suppress_embeds=True,
             )
-        audio, fmt = last
-        if fmt != "ogg_opus":
+        if len(last) == 1 and last[0][1] == "ogg_opus":
+            audio = last[0][0]
+        else:
             try:
-                audio = await asyncio.to_thread(_transcode_to_ogg_opus, audio)
+                audio = await asyncio.to_thread(_join_to_ogg_opus, [clip for clip, _ in last])
             except Exception as e:
                 print(f"[narrate] voiceline transcode failed: {e}")
                 return await ctx.send("Failed to save voiceline: couldn't convert the audio.", suppress_embeds=True)
@@ -1609,6 +1724,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if guild_id is None or user_id is None:
             return
 
+        if not await self._may_edit_voiceline(ctx, guild_id, user_id, old_name):
+            return await ctx.send("Only whoever saved that voiceline (or a server manager) can rename it.", suppress_embeds=True)
         try:
             ok = await self._rename_voiceline(guild_id, old_name, new_name)
         except Exception as e:
@@ -1627,6 +1744,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if guild_id is None or user_id is None:
             return
 
+        if not await self._may_edit_voiceline(ctx, guild_id, user_id, name):
+            return await ctx.send("Only whoever saved that voiceline (or a server manager) can delete it.", suppress_embeds=True)
         try:
             ok = await self._delete_voiceline(guild_id, name)
         except Exception as e:
@@ -1636,6 +1755,16 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             return await ctx.send(f"No voiceline named `{name}` found.", suppress_embeds=True)
 
         await ctx.send(f"Deleted voiceline `{name}`.", suppress_embeds=True)
+
+    async def _may_edit_voiceline(self, ctx: commands.Context, guild_id: int, user_id: int, name: str) -> bool:
+        """Creator or manage_guild. Unknown names return True so the command reports 'not found'."""
+        if ctx.author.guild_permissions.manage_guild:
+            return True
+        row = await self.db.fetchrow(
+            "SELECT created_by_user_id FROM guild_voicelines WHERE guild_id=$1 AND name=$2",
+            int(guild_id), _normalize_voiceline(name or ""),
+        )
+        return row is None or row["created_by_user_id"] == user_id
 
     async def _notify_fallback(self, guild: discord.Guild, channel_id: int, reason: str) -> None:
         """Tell the channel a paid voice fell back to Google, without repeating it every message."""
@@ -1657,77 +1786,96 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             except Exception:
                 pass
 
-    async def _narrate_worker(self):
+    async def _guild_worker(self, guild_id: int, q: asyncio.Queue):
+        """Synthesize this guild's messages in order; one bad message never kills the worker."""
         try:
             while True:
-                guild_id, user_id, text, voice, style, rate, channel_id = await self._narrate_queue.get()
+                item = await q.get()
                 try:
-                    if not text:
-                        continue
-
-                    guild = self.bot.get_guild(guild_id)
-                    if not guild:
-                        continue
-                    member = guild.get_member(user_id)
-                    if not member or not (member.voice and member.voice.channel):
-                        continue
-
-                    ### CHECK IF VOICELINE EXISTS (in which case tts api won't be called) ###
-                    try:
-                        voiceline_data = await self._resolve_voiceline_override(
-                            guild_id=guild_id,
-                            text=text
-                        )  # returns None if no voiceline found
-                    except Exception as e:
-                        ch = guild.get_channel(channel_id)
-                        if ch:
-                            try:
-                                await ch.send(
-                                    "Voiceline retrieval failed",
-                                    suppress_embeds=True,
-                                )
-                            except Exception:
-                                pass
-                        voiceline_data = None
-                        print(f"something fucky happened with voiceline retrieval check {text}: {e}")
-
-                    async with self._guild_lock(guild_id):
-                        session = self._get_session(guild_id)
-                        try:
-                            await session.ensure_connected(member.voice.channel)
-                        except Exception as e:
-                            print(f"[narrate] ensure_connected error: {e}")
-                            continue
-
-                        if voiceline_data:
-                            self._last_narrated_audio[(guild_id, user_id)] = (voiceline_data, "ogg_opus")
-                            await session.enqueue(voiceline_data)
-                        else:
-                            # NO voiceline data -- do normal tts api call
-                            chunks = chunk_text(text, self.router.chunk_limit(voice))
-                            if not chunks:
-                                continue
-
-                            try:
-                                for part in chunks:
-                                    res = await self.router.synth(voice, part, style=style, rate=rate)
-                                    if res.fallback_reason:
-                                        await self._notify_fallback(guild, channel_id, res.fallback_reason)
-                                    self._last_narrated_audio[(guild_id, user_id)] = (res.audio, res.fmt)
-                                    await session.enqueue(res.audio)
-                            except Exception as e:
-                                ch = guild.get_channel(channel_id)
-                                if ch:
-                                    try:
-                                        await ch.send(
-                                            "TTS failed.",
-                                            suppress_embeds=True,
-                                        )
-                                    except Exception:
-                                        pass
-                                print(f"[narrate] synth error: {e}")
-                                continue
+                    await self._narrate_one(guild_id, *item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[narrate] worker error: guild={guild_id}: {e!r}")
                 finally:
-                    self._narrate_queue.task_done()
+                    q.task_done()
         except asyncio.CancelledError:
             return
+
+    async def _narrate_one(self, guild_id: int, user_id: int, text: str, voice: str, style: Optional[str],
+                           rate: float, channel_id: int, gen: int):
+        if not text:
+            return
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+        session = self._get_session(guild_id)
+        if session.generation != gen:
+            return  # cancelled / shut off / torn down since this was queued
+
+        # Prefs can change while a message waits (off, shutoff, kick, channel change): re-check them.
+        pref = await self._get_pref(guild_id, user_id)
+        if not pref or not pref.get("enabled") or pref.get("text_channel_id") != channel_id:
+            return
+        member = guild.get_member(user_id)
+        if not member or not (member.voice and member.voice.channel):
+            return
+
+        ### CHECK IF VOICELINE EXISTS (in which case tts api won't be called) ###
+        try:
+            voiceline_data = await self._resolve_voiceline_override(
+                guild_id=guild_id,
+                text=text
+            )  # returns None if no voiceline found
+        except Exception as e:
+            ch = guild.get_channel(channel_id)
+            if ch:
+                try:
+                    await ch.send(
+                        "Voiceline retrieval failed",
+                        suppress_embeds=True,
+                    )
+                except Exception:
+                    pass
+            voiceline_data = None
+            print(f"[narrate] voiceline retrieval check failed for {text!r}: {e}")
+
+        try:
+            await session.ensure_connected(member.voice.channel)
+        except Exception as e:
+            print(f"[narrate] ensure_connected error: {e}")
+            return
+
+        if voiceline_data:
+            self._last_narrated_audio[(guild_id, user_id)] = [(voiceline_data, "ogg_opus")]
+            await session.enqueue(voiceline_data)
+            return
+
+        # NO voiceline data -- do normal tts api call
+        first, cap = self.router.chunk_plan(voice)
+        chunks = chunk_for_speech(text, first, cap)
+        clips: List[Tuple[bytes, str]] = []
+        self._last_narrated_audio[(guild_id, user_id)] = clips
+        try:
+            for part in chunks:
+                if session.generation != gen:
+                    return  # cancelled mid-message: don't pay for the rest
+                res = await self.router.synth(voice, part, style=style, rate=rate)
+                if res.fallback_reason:
+                    await self._notify_fallback(guild, channel_id, res.fallback_reason)
+                if session.generation != gen:
+                    return
+                await self._add_user_spend(user_id, res.cost_usd)
+                clips.append((res.audio, res.fmt))
+                await session.enqueue(res.audio)
+        except Exception as e:
+            ch = guild.get_channel(channel_id)
+            if ch:
+                try:
+                    await ch.send(
+                        "TTS failed.",
+                        suppress_embeds=True,
+                    )
+                except Exception:
+                    pass
+            print(f"[narrate] synth error: {e}")

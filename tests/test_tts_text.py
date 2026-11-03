@@ -1,6 +1,6 @@
 import unittest
 
-from tts_text import expand_slang, map_inline_tags, prepare, split_leading_style
+from tts_text import chunk_for_speech, expand_slang, map_inline_tags, prepare, split_leading_style
 
 
 class SplitLeadingStyleTests(unittest.TestCase):
@@ -53,6 +53,55 @@ class PrepareTests(unittest.TestCase):
 
     def test_google_ignores_style_and_slang(self):
         self.assertEqual(prepare("idk [sigh] fine", "google", "tired"), ("idk fine", None))
+
+
+RANT = ("I swear this game hates me. I queued for forty minutes, finally got in, and the first thing that happens is "
+        "my teammate disconnects. Then the other one starts arguing with the enemy team in all chat instead of playing. "
+        "We lost in like eight minutes. Eight! I'm not even mad about losing, I'm mad that I waited forty minutes for that. "
+        "Anyway I'm taking a break, someone ping me if you want to do something chill later.")
+
+
+class ChunkForSpeechTests(unittest.TestCase):
+    def test_short_text_is_one_chunk(self):
+        self.assertEqual(chunk_for_speech("hey all", 90, 600), ["hey all"])
+        self.assertEqual(chunk_for_speech("", 90, 600), [])
+
+    def test_long_first_word_never_yields_an_empty_chunk(self):
+        chunks = chunk_for_speech("a" * 200 + " then words", 90, 600)
+        self.assertTrue(all(chunks))
+        self.assertTrue(all(len(c) <= 600 for c in chunks))
+        self.assertLessEqual(len(chunks[0]), 90)
+
+    def test_keeps_every_word_in_order(self):
+        chunks = chunk_for_speech(RANT, 90, 600)
+        self.assertEqual(" ".join(chunks).split(), RANT.split())
+
+    def test_small_first_chunk_then_growth_within_cap(self):
+        chunks = chunk_for_speech(RANT, 90, 600)
+        self.assertLessEqual(len(chunks[0]), 90)
+        self.assertGreater(len(chunks[1]), len(chunks[0]))
+        self.assertTrue(all(len(c) <= 600 for c in chunks))
+
+    def test_breaks_land_on_sentences_or_clauses(self):
+        for first, cap in ((90, 600), (150, 900), (220, 1200)):
+            for c in chunk_for_speech(RANT, first, cap)[:-1]:
+                self.assertRegex(c, r"[.!?,;:]$")
+
+    def test_run_on_breaks_before_conjunctions(self):
+        run_on = ("so basically we were halfway through the dungeon and sam pulls the entire room because he thought "
+                  "the boss was dead and then everyone panics and jordan uses the only revive on the wrong person")
+        chunks = chunk_for_speech(run_on, 90, 600)
+        for c in chunks[1:]:
+            self.assertIn(c.split()[0].lower(), {"and", "but", "so", "then", "because", "which", "when", "while", "until"})
+
+    def test_tags_are_never_split(self):
+        text = "okay so [very long dramatic pause] that happened, " * 6
+        for c in chunk_for_speech(text, 40, 120):
+            self.assertEqual(c.count("["), c.count("]"))
+
+    def test_line_breaks_are_boundaries(self):
+        self.assertEqual(chunk_for_speech("first line here\nsecond line here, which is a bit longer", 20, 600),
+                         ["first line here", "second line here, which is a bit longer"])
 
 
 if __name__ == "__main__":

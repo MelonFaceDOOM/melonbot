@@ -6,6 +6,7 @@ from collections import defaultdict
 from discord.ext import commands
 from discord.utils import get
 from discord import Intents
+from discord import AllowedMentions
 from discord import File
 from matching import find_closest_match_and_score, rank_matches
 from config import (
@@ -2069,6 +2070,8 @@ bot = BottyBoy(
     case_insensitive=True,
     intents=intents,
     description="ur fav movienight companion.",
+    # Bot replies echo user text (narrate styles, voice names, ...); never let that ping anyone.
+    allowed_mentions=AllowedMentions.none(),
 )
 
 bot.help_command = BotHelpCommand()

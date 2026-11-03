@@ -9,7 +9,7 @@ Gemini takes the style as a separate annotation and events as <angle> tags.
 Fish takes both as inline [square] cues. Google has no emotion control, so tags are stripped.
 """
 import re
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 PROVIDERS = ("google", "fish", "gemini")
 
@@ -87,6 +87,102 @@ def map_inline_tags(text: str, provider: str) -> str:
 
 def expand_slang(text: str) -> str:
     return _SLANG_RE.sub(lambda m: _SLANG[m.group(1).lower()], text)
+
+
+# ---------- chunking ----------
+# Sentence ends (keeping closing quotes/brackets with the sentence) and line breaks
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+|(?<=[.!?…][\"')\]])\s+|\n+")
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[,;:])\s+|\s+(?=[—–-]\s)")
+# Run-ons without punctuation: break before a conjunction rather than at an arbitrary space
+_CONJ_SPLIT_RE = re.compile(r"\s+(?=(?:and|but|so|then|because|which|when|while|until)\s)", re.IGNORECASE)
+_TAG_SPACE = "\x00"
+
+
+def _protect_tags(text: str) -> str:
+    """Keep [multi word tags] in one piece while splitting."""
+    return _BRACKET_RE.sub(lambda m: m.group(0).replace(" ", _TAG_SPACE), text)
+
+
+def _split_words(piece: str, limit: int) -> List[str]:
+    out, cur = [], ""
+    for word in piece.split():
+        while len(word) > limit:  # keyboard mash / long URL remnants: hard split
+            if cur:
+                out.append(cur)
+                cur = ""
+            out.append(word[:limit])
+            word = word[limit:]
+        if cur and len(cur) + 1 + len(word) > limit:
+            out.append(cur)
+            cur = word
+        else:
+            cur = f"{cur} {word}" if cur else word
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _split_long(sentence: str, limit: int) -> List[str]:
+    """Split an over-long sentence at clauses, then conjunctions, then words; repack up to limit."""
+    parts = []
+    for clause in _CLAUSE_SPLIT_RE.split(sentence):
+        for sub in (_CONJ_SPLIT_RE.split(clause) if len(clause) > limit else [clause]):
+            parts.extend(_split_words(sub, limit) if len(sub) > limit else [sub])
+    out, cur = [], ""
+    for part in (p.strip() for p in parts):
+        if not part:
+            continue
+        if cur and len(cur) + 1 + len(part) > limit:
+            out.append(cur)
+            cur = part
+        else:
+            cur = f"{cur} {part}" if cur else part
+    if cur:
+        out.append(cur)
+    return out
+
+
+def chunk_for_speech(text: str, first: int, cap: int, growth: float = 3.0, min_tail: int = 40) -> List[str]:
+    """
+    Split text for sequential TTS requests: a small first chunk so audio starts quickly, then chunks
+    up to `growth`x the previous one (each is synthesized while the previous plays), capped at `cap`.
+    Breaks prefer sentence ends, then clauses/conjunctions, and only then plain spaces.
+    """
+    text = _collapse_lines(_protect_tags(text or ""))
+    if not text:
+        return []
+    if len(text) <= first:
+        return [text.replace(_TAG_SPACE, " ")]
+
+    chunks: List[str] = []
+    cur, limit = "", first
+    for sentence in (s.strip() for s in _SENT_SPLIT_RE.split(text)):
+        if not sentence:
+            continue
+        for piece in (_split_long(sentence, limit) if len(sentence) > limit else [sentence]):
+            if cur and len(cur) + 1 + len(piece) > limit:
+                chunks.append(cur)
+                cur = piece
+                limit = min(cap, max(limit, int(len(chunks[-1]) * growth)))
+            else:
+                cur = f"{cur} {piece}" if cur else piece
+            # Ship the first chunk as soon as it holds a full sentence/clause near the target size
+            if not chunks and len(cur) >= first * 0.6:
+                chunks.append(cur)
+                cur = ""
+                limit = min(cap, max(first, int(len(chunks[-1]) * growth)))
+    if cur:
+        # Fold a short leftover into the previous chunk, but never into the first (that one is kept small for speed)
+        if len(chunks) > 1 and len(cur) < min_tail and len(chunks[-1]) + 1 + len(cur) <= cap:
+            chunks[-1] = f"{chunks[-1]} {cur}"
+        else:
+            chunks.append(cur)
+    return [c.replace(_TAG_SPACE, " ") for c in chunks]
+
+
+def _collapse_lines(s: str) -> str:
+    """Collapse spaces but keep line breaks (they're sentence boundaries)."""
+    return "\n".join(" ".join(line.split()) for line in s.splitlines() if line.strip())
 
 
 def prepare(text: str, provider: str, style: Optional[str] = None) -> Tuple[str, Optional[str]]:

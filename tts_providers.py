@@ -34,7 +34,7 @@ DEFAULT_GOOGLE_VOICE = "en-US-Wavenet-D"   # free fallback; must be a full canon
 DEFAULT_LANG = "en-US"
 DEFAULT_RATE = 1.0
 
-GOOGLE_TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}"
+GOOGLE_TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize"
 FISH_TTS_ENDPOINT = "https://api.fish.audio/v1/tts"
 FISH_MODEL_ENDPOINT = "https://api.fish.audio/model"
 FISH_VOICE_DESIGN_ENDPOINT = "https://api.fish.audio/v1/voice-design"
@@ -123,10 +123,13 @@ class LRUCache:
     """
     Caches requests to & responses from the TTS services.
 
-    Values (Tuple[bytes, int]): the compressed audio, and the last-access timestamp (ms) used for LRU eviction.
+    Values (Tuple[bytes, int]): the audio, and the last-access timestamp (ms) used for LRU eviction.
+    Bounded by item count and, optionally, total bytes.
     """
-    def __init__(self, max_items: int):
+    def __init__(self, max_items: int, max_bytes: Optional[int] = None):
         self.max = max_items
+        self.max_bytes = max_bytes
+        self.bytes = 0
         self.store: Dict[Hashable, Tuple[bytes, int]] = {}
 
     def get(self, key: Hashable) -> Optional[bytes]:
@@ -138,13 +141,16 @@ class LRUCache:
         return audio
 
     def put(self, key: Hashable, audio: bytes) -> None:
-        if key in self.store:
-            self.store[key] = (audio, _now_ms())
+        if self.max_bytes is not None and len(audio) > self.max_bytes:
             return
-        if len(self.store) >= self.max:
+        if key in self.store:
+            self.bytes -= len(self.store[key][0])
+        while self.store and (len(self.store) >= self.max or
+                              (self.max_bytes is not None and self.bytes + len(audio) > self.max_bytes)):
             oldest_key = min(self.store.items(), key=lambda kv: kv[1][1])[0]
-            self.store.pop(oldest_key, None)
+            self.bytes -= len(self.store.pop(oldest_key)[0])
         self.store[key] = (audio, _now_ms())
+        self.bytes += len(audio)
 
 
 def _now_ms() -> int:
@@ -159,19 +165,19 @@ class RpmLimiter:
         self.lock = asyncio.Lock()
 
     async def acquire(self, max_wait: float) -> bool:
-        """Wait for a slot; give up (False) if that would take longer than max_wait seconds."""
-        async with self.lock:
-            now = time.monotonic()
-            self.starts = [t for t in self.starts if now - t < 60]
-            if len(self.starts) >= self.rpm:
-                wait = 60 - (now - self.starts[0]) + 0.05
-                if wait > max_wait:
-                    return False
-                await asyncio.sleep(wait)
+        """Wait for a slot; give up (False) if that would take longer than max_wait seconds in total."""
+        deadline = time.monotonic() + max_wait
+        while True:
+            async with self.lock:
                 now = time.monotonic()
                 self.starts = [t for t in self.starts if now - t < 60]
-            self.starts.append(now)
-            return True
+                if len(self.starts) < self.rpm:
+                    self.starts.append(now)
+                    return True
+                wait = 60 - (now - self.starts[0]) + 0.05
+            if now + wait > deadline:
+                return False
+            await asyncio.sleep(wait)
 
 
 class _HttpProvider:
@@ -240,10 +246,10 @@ class GoogleTTSProvider(_HttpProvider):
             "audioConfig": audio_cfg
         }
 
-        url = GOOGLE_TTS_ENDPOINT.format(api_key=self.api_key)
         session = await self._sess()
         async with self._sem:
-            async with session.post(url, json=payload) as resp:
+            async with session.post(GOOGLE_TTS_ENDPOINT, json=payload,
+                                    headers={"x-goog-api-key": self.api_key}) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     raise RuntimeError(f"Google TTS error {resp.status}: {body[:500]}")
@@ -447,7 +453,10 @@ class BudgetTracker:
         self.cap = float(monthly_cap_usd)
         self._month: Optional[date] = None
         self._totals: Dict[str, float] = {}
+        # Spend that couldn't be written yet: provider -> [usd, requests, chars, audio_ms]
+        self._unsaved: Dict[str, List[float]] = {}
         self._lock = asyncio.Lock()
+        self._load_failed_at: Optional[float] = None
 
     @staticmethod
     def current_month() -> date:
@@ -459,28 +468,43 @@ class BudgetTracker:
         except Exception:
             return None
 
-    async def _ensure_loaded(self):
+    async def _ensure_loaded(self) -> bool:
+        """Load this month's totals. False = unknown (DB unreachable); callers treat that as over budget."""
         month = self.current_month()
         if self._month == month:
-            return
-        totals: Dict[str, float] = {}
+            return True
         db = self._db()
+        totals: Dict[str, float] = {}
         if db is not None:
+            # Don't hammer a down DB on every message
+            if self._load_failed_at and time.monotonic() - self._load_failed_at < 30:
+                return False
             try:
                 rows = await db.fetch("SELECT provider, est_usd FROM tts_usage WHERE month=$1", month)
                 totals = {r["provider"]: float(r["est_usd"]) for r in rows}
             except Exception as e:
-                print(f"[tts] failed to load usage: {e}")
+                print(f"[tts] failed to load usage (paid voices paused until it loads): {e}")
+                self._load_failed_at = time.monotonic()
+                return False
+        self._load_failed_at = None
+        if self._month is not None and self._month != month:
+            self._unsaved = {}  # new month: last month's unwritten spend no longer counts toward the cap
+        # Spend recorded while the DB was unreachable isn't in the DB yet; count it and write it on next record()
+        for prov, (p_usd, *_rest) in self._unsaved.items():
+            totals[prov] = totals.get(prov, 0.0) + p_usd
         self._month, self._totals = month, totals
+        return True
 
     async def spent(self) -> float:
         async with self._lock:
-            await self._ensure_loaded()
+            if not await self._ensure_loaded():
+                return float("inf")
             return sum(self._totals.values())
 
     async def by_provider(self) -> Dict[str, float]:
         async with self._lock:
-            await self._ensure_loaded()
+            if not await self._ensure_loaded():
+                raise RuntimeError("usage totals unavailable (database unreachable)")
             return dict(self._totals)
 
     async def exhausted(self) -> bool:
@@ -488,26 +512,38 @@ class BudgetTracker:
 
     async def record(self, provider: str, usd: float, chars: int = 0, audio_ms: int = 0):
         async with self._lock:
-            await self._ensure_loaded()
-            self._totals[provider] = self._totals.get(provider, 0.0) + usd
+            loaded = await self._ensure_loaded()
+            pending = self._unsaved.setdefault(provider, [0.0, 0, 0, 0])
+            pending[0] += usd
+            pending[1] += 1
+            pending[2] += int(chars)
+            pending[3] += int(audio_ms)
+            if loaded:
+                self._totals[provider] = self._totals.get(provider, 0.0) + usd
             db = self._db()
-            if db is None:
+            if db is None or not loaded:
+                if db is None:
+                    self._unsaved.pop(provider, None)  # no DB configured: in-memory only
                 return
-            try:
-                await db.execute(
-                    """
-                    INSERT INTO tts_usage (month, provider, requests, chars, audio_ms, est_usd)
-                    VALUES ($1, $2, 1, $3, $4, $5)
-                    ON CONFLICT (month, provider) DO UPDATE SET
-                        requests = tts_usage.requests + 1,
-                        chars    = tts_usage.chars + EXCLUDED.chars,
-                        audio_ms = tts_usage.audio_ms + EXCLUDED.audio_ms,
-                        est_usd  = tts_usage.est_usd + EXCLUDED.est_usd
-                    """,
-                    self._month, provider, int(chars), int(audio_ms), round(usd, 6),
-                )
-            except Exception as e:
-                print(f"[tts] failed to record usage: {e}")
+            # Write this spend plus anything a previous failed write left behind
+            for prov, (p_usd, p_req, p_chars, p_ms) in list(self._unsaved.items()):
+                try:
+                    await db.execute(
+                        """
+                        INSERT INTO tts_usage (month, provider, requests, chars, audio_ms, est_usd)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        ON CONFLICT (month, provider) DO UPDATE SET
+                            requests = tts_usage.requests + EXCLUDED.requests,
+                            chars    = tts_usage.chars + EXCLUDED.chars,
+                            audio_ms = tts_usage.audio_ms + EXCLUDED.audio_ms,
+                            est_usd  = tts_usage.est_usd + EXCLUDED.est_usd
+                        """,
+                        self._month, prov, int(p_req), int(p_chars), int(p_ms), round(p_usd, 6),
+                    )
+                    self._unsaved.pop(prov, None)
+                except Exception as e:
+                    print(f"[tts] failed to record usage (will retry): {e}")
+                    break
 
 
 # ==========================
@@ -519,6 +555,7 @@ class SynthResult:
     fmt: str                         # 'ogg_opus' | 'wav'
     provider: str                    # provider that actually produced the audio
     fallback_reason: Optional[str]   # None, or why a paid voice fell back to Google
+    cost_usd: float = 0.0            # estimated spend for this request (0 for Google and cache hits)
 
 
 def parse_voice_ref(ref: Optional[str]) -> Tuple[str, str]:
@@ -543,8 +580,9 @@ def google_language(voice_name: str) -> str:
 
 
 class TTSRouter:
-    # Paid providers tolerate longer chunks: fewer requests (Gemini RPM) and steadier prosody.
-    CHUNK_CHARS = {"google": 180, "fish": 400, "gemini": 400}
+    # (first chunk, max chunk) chars. Small first chunk = fast first audio; later chunks grow because
+    # each is synthesized while the previous one plays. Gemini: few, big chunks (high fixed latency, low RPM).
+    CHUNK_PLAN = {"google": (150, 900), "fish": (90, 600), "gemini": (220, 1200)}
 
     def __init__(self, google: GoogleTTSProvider, fish: Optional[FishTTSProvider],
                  gemini: Optional[GeminiTTSProvider], budget: BudgetTracker,
@@ -553,7 +591,7 @@ class TTSRouter:
         self.fish = fish
         self.gemini = gemini
         self.budget = budget
-        self._cache = LRUCache(CACHE_MAX_ITEMS)
+        self._cache = LRUCache(CACHE_MAX_ITEMS, max_bytes=64 * 1024 * 1024)
         # Unsaved Fish voices ('fish:ref:<key>') are spoken from a stored sample; loader returns (audio, transcript)
         self._reference_loader = reference_loader
         self._references: Dict[str, Tuple[bytes, str]] = {}
@@ -576,8 +614,8 @@ class TTSRouter:
             if p:
                 await p.close()
 
-    def chunk_limit(self, voice_ref: Optional[str]) -> int:
-        return self.CHUNK_CHARS[parse_voice_ref(voice_ref)[0]]
+    def chunk_plan(self, voice_ref: Optional[str]) -> Tuple[int, int]:
+        return self.CHUNK_PLAN[parse_voice_ref(voice_ref)[0]]
 
     async def synth(self, voice_ref: Optional[str], text: str, style: Optional[str] = None,
                     rate: float = DEFAULT_RATE) -> SynthResult:
@@ -622,11 +660,16 @@ class TTSRouter:
                 audio = await client.synth(prepared, None, speed=rate, reference=sample)
             else:
                 audio = await client.synth(prepared, voice_id, speed=rate)
-            await self.budget.record("fish", fish_cost(prepared, client.model), chars=len(prepared))
+            cost = fish_cost(prepared, client.model)
+            await self.budget.record("fish", cost, chars=len(prepared))
         else:
             audio = await client.synth(prepared, voice_id, sep_style)
             secs = wav_duration(audio)
-            await self.budget.record("gemini", gemini_cost(prepared, sep_style, secs, client.model),
-                                     chars=len(prepared), audio_ms=int(secs * 1000))
+            if secs <= 0:
+                # Unparseable WAV: estimate (~12 chars/s of speech) so spend still counts toward the cap
+                print(f"[tts] couldn't read Gemini audio length ({len(audio)} bytes); estimating")
+                secs = max(1.0, len(prepared) / 12)
+            cost = gemini_cost(prepared, sep_style, secs, client.model)
+            await self.budget.record("gemini", cost, chars=len(prepared), audio_ms=int(secs * 1000))
         self._cache.put(key, audio)
-        return SynthResult(audio, audio_format(audio), provider, None)
+        return SynthResult(audio, audio_format(audio), provider, None, cost)

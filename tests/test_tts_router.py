@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from datetime import date
 from unittest.mock import AsyncMock, Mock
@@ -82,9 +83,11 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((res.provider, res.fallback_reason), ("google", "not_configured"))
 
     async def test_repeat_message_is_cached(self):
-        await self.router.synth(f"fish:{FISH_ID}", "same thing")
-        await self.router.synth(f"fish:{FISH_ID}", "same thing")
+        first = await self.router.synth(f"fish:{FISH_ID}", "same thing")
+        again = await self.router.synth(f"fish:{FISH_ID}", "same thing")
         self.assertEqual(self.fish.synth.await_count, 1)
+        self.assertGreater(first.cost_usd, 0)
+        self.assertEqual(again.cost_usd, 0)  # cache hits are free
 
     async def test_designed_voice_sends_stored_sample_inline(self):
         loader = AsyncMock(return_value=(OGG, "sample transcript"))
@@ -100,9 +103,60 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         res = await router.synth("fish:ref:gone", "hello")
         self.assertEqual((res.provider, res.fallback_reason), ("google", "error"))
 
-    def test_chunk_limits(self):
-        self.assertEqual(self.router.chunk_limit("en-US-Wavenet-D"), 180)
-        self.assertEqual(self.router.chunk_limit(f"fish:{FISH_ID}"), 400)
+    def test_chunk_plans(self):
+        self.assertEqual(self.router.chunk_plan("en-US-Wavenet-D"), (150, 900))
+        self.assertEqual(self.router.chunk_plan(f"fish:{FISH_ID}"), (90, 600))
+
+
+class FlakyDb:
+    def __init__(self):
+        self.down = True
+        self.writes = []
+
+    async def fetch(self, sql, *a):
+        if self.down:
+            raise ConnectionError("db down")
+        return [{"provider": "fish", "est_usd": 9.0}]
+
+    async def execute(self, sql, *a):
+        if self.down:
+            raise ConnectionError("db down")
+        self.writes.append(a)
+
+
+class BudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unreadable_db_fails_closed(self):
+        db = FlakyDb()
+        budget = BudgetTracker(lambda: db, monthly_cap_usd=10.0)
+        self.assertTrue(await budget.exhausted())
+        google = Mock(); google.synth = AsyncMock(return_value=OGG)
+        fish = Mock(model="s2.1-pro"); fish.synth = AsyncMock(return_value=OGG)
+        res = await TTSRouter(google, fish, None, budget).synth(f"fish:{FISH_ID}", "hello")
+        self.assertEqual(res.fallback_reason, "budget")
+
+    async def test_spend_during_outage_is_counted_and_written_later(self):
+        db = FlakyDb()
+        budget = BudgetTracker(lambda: db, monthly_cap_usd=10.0)
+        await budget.record("fish", 0.5, chars=10)     # DB down: kept for later
+        db.down = False
+        budget._load_failed_at = None
+        self.assertAlmostEqual(await budget.spent(), 9.5)   # 9.0 in DB + 0.5 unsaved
+        await budget.record("fish", 0.25, chars=5)
+        self.assertEqual(len(db.writes), 1)
+        self.assertAlmostEqual(float(db.writes[0][-1]), 0.75)  # both increments in one write
+        self.assertAlmostEqual(await budget.spent(), 9.75)
+
+
+class CacheTests(unittest.TestCase):
+    def test_byte_cap_evicts_oldest(self):
+        c = tts_providers.LRUCache(100, max_bytes=10)
+        c.put("a", b"12345")
+        c.put("b", b"12345")
+        c.put("c", b"12345")
+        self.assertIsNone(c.get("a"))
+        self.assertEqual(c.bytes, 10)
+        c.put("huge", b"x" * 11)  # bigger than the whole cache: not cached
+        self.assertIsNone(c.get("huge"))
 
 
 class RpmLimiterTests(unittest.IsolatedAsyncioTestCase):
@@ -111,6 +165,14 @@ class RpmLimiterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await lim.acquire(max_wait=0))
         self.assertTrue(await lim.acquire(max_wait=0))
         self.assertFalse(await lim.acquire(max_wait=1))
+
+    async def test_concurrent_waiters_respect_deadline(self):
+        lim = tts_providers.RpmLimiter(1)
+        await lim.acquire(max_wait=0)
+        t = asyncio.get_running_loop().time()
+        results = await asyncio.gather(lim.acquire(max_wait=0.2), lim.acquire(max_wait=0.2))
+        self.assertEqual(results, [False, False])
+        self.assertLess(asyncio.get_running_loop().time() - t, 0.5)
 
 
 if __name__ == "__main__":
