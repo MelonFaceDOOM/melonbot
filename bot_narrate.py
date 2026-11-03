@@ -3,14 +3,24 @@ import asyncpg
 from pathlib import Path
 import time
 import io
-import base64
+import subprocess
+from datetime import date
 from typing import Optional, Dict, Tuple, List, Union
-import aiohttp
 import discord
 from discord.ext import commands
-from config import google_narrate_key
+from config import (
+    google_narrate_key, fish_api_key, gemini_api_key, FISH_DEFAULT_VOICE_ID, FISH_MODEL,
+    GEMINI_MODEL, GEMINI_RPM, TTS_MONTHLY_BUDGET_USD,
+)
 from bot_helpers import get_user_id, get_guild_id
 from db_mixin import DbMixin
+# LRUCache / GoogleTTSProvider / DEFAULT_LANG lived here before tts_providers; still importable from bot_narrate.
+from tts_providers import (
+    BudgetTracker, FishTTSProvider, GeminiTTSProvider, GoogleTTSProvider, LRUCache, TTSRouter,
+    DEFAULT_GOOGLE_VOICE, DEFAULT_LANG, DEFAULT_RATE, FISH_REF_PREFIX, FISH_VOICE_DESIGN_USD, ProviderError,
+    audio_format, extract_fish_id, parse_voice_ref,
+)
+from tts_text import split_leading_style
 import re
 import uuid
 import os
@@ -19,20 +29,31 @@ import tempfile
 # ==========================
 # Tuning knobs & feature flags
 # ==========================
-MAX_CHARS_PER_CHUNK = 180                  # small chunks → faster time-to-first-audio
+MAX_CHARS_PER_CHUNK = 180                  # small chunks → faster time-to-first-audio (Google)
 NARRATE_WORKERS = 4                        # will reduce lag if multiple guilds are narrating
-CACHE_MAX_ITEMS = 512                      # in-memory audio cache entries
 PLAYBACK_IDLE_DISCONNECT_SECS = 3600       # leave VC when idle
-DEFAULT_VOICE = "en-US-Wavenet-D"          # must be a full canonical name
-DEFAULT_LANG = "en-US"
-DEFAULT_RATE = 1.0                         # 0.25–4.0 (classic voices only)
+# Voice ref for users who haven't picked one; existing Google picks are left alone.
+DEFAULT_VOICE = f"fish:{FISH_DEFAULT_VOICE_ID.lower()}" if (FISH_DEFAULT_VOICE_ID and fish_api_key) else DEFAULT_GOOGLE_VOICE
 FFMPEG_BIN = "ffmpeg"
 PLAY_TIMEOUT = 120                          # max seconds per clip
+DESIGN_COOLDOWN_SECS = 60                   # per user, for !narrate design
+# Also the transcript Fish clones from for locally kept designs, so use most of the 150-char limit
+DESIGN_PREVIEW_LINE = ("Hey everyone, it's me. I have some news, and honestly, you are not going to believe it. "
+                       "Pull up a chair, because this one is a long story.")
+DESIGN_VIEW_TIMEOUT = 600
 
-# Global TTS concurrency (simple protection for many guilds)
-GLOBAL_TTS_CONCURRENCY = 10
+FISH_LIBRARY_URL = "https://fish.audio/voice-library/"
+GEMINI_VOICES_URL = "https://cloud.google.com/text-to-speech/docs/gemini-tts"
+GOOGLE_VOICES_URL = "https://cloud.google.com/text-to-speech/docs/voices"
 
-GOOGLE_TTS_ENDPOINT = "https://texttospeech.googleapis.com/v1/text:synthesize?key={api_key}"
+# fallback_reason -> (notice, cooldown seconds; None = once per month)
+FALLBACK_NOTICES = {
+    "budget": ("This month's TTS budget is used up, so narration is using the free Google voice until next month.", None),
+    "balance": ("The Fish Audio credit has run out, so narration is using the free Google voice until it's topped up.", None),
+    "not_configured": ("That voice's provider isn't set up on this bot, so narration is using the Google voice.", None),
+    "rate_limited": ("Gemini is rate limiting right now, so some messages used the Google voice.", 3600),
+    "error": ("The selected voice failed, so that message used the Google voice instead.", 3600),
+}
 
 
 # ==========================
@@ -120,6 +141,13 @@ def _short_voice_name(voice_name: str) -> str:
     parts = voice_name.split("-", 2)
     return parts[2] if len(parts) >= 3 else voice_name
 
+def _voice_display(voice_ref: str, label: Optional[str]) -> str:
+    """Human-readable voice for status lines: 'Label (Fish)' / 'Label (Gemini)' / Google name."""
+    provider, _ = parse_voice_ref(voice_ref)
+    if provider == "google":
+        return f"{voice_ref} ({label})" if label else voice_ref
+    return f"{label or voice_ref} ({'Fish' if provider == 'fish' else 'Gemini'})"
+
 def chunk_text(text: str, limit: int = MAX_CHARS_PER_CHUNK) -> List[str]:
     text = text.strip()
     if len(text) <= limit:
@@ -164,111 +192,14 @@ def _atomic_write_bytes(dest_path: Path, data: bytes) -> None:
         except Exception:
             pass
 
-class LRUCache:
-    """
-    Caches requests to & responses from the TTS service
-    
-    Keys (Dict[Tuple[str, str, float):
-        f"{language}:{voice}:{text}", audio_encoding, speaking_rate
-
-    Values (Tuple[bytes, int]):
-        bytes = the compressed audio returned by Google TTS (e.g., OGG/Opus).
-        int = the last-access timestamp (ms) used for LRU eviction
-    """
-    def __init__(self, max_items: int):
-        self.max = max_items
-        self.store: Dict[Tuple[str, str, float], Tuple[bytes, int]] = {}
-
-    def get(self, key: Tuple[str, str, float]) -> Optional[bytes]:
-        val = self.store.get(key)
-        if not val:
-            return None
-        audio, _ = val
-        self.store[key] = (audio, _now_ms())
-        return audio
-
-    def put(self, key: Tuple[str, str, float], audio: bytes) -> None:
-        if key in self.store:
-            self.store[key] = (audio, _now_ms())
-            return
-        if len(self.store) >= self.max:
-            oldest_key = min(self.store.items(), key=lambda kv: kv[1][1])[0]
-            self.store.pop(oldest_key, None)
-        self.store[key] = (audio, _now_ms())
-
-
-# ==========================
-# TTS Provider (Google)
-# ==========================
-class GoogleTTSProvider:
-    """
-    Google Cloud Text-to-Speech v1 REST.
-    - Returns compressed (OGG_OPUS) bytes; we transcode to PCM via ffmpeg pipe.
-    - Uses a tiny in-memory cache and a global concurrency cap.
-    - Automatically adapts payload for Chirp/Journey voices (omit classic knobs).
-    """
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._cache = LRUCache(CACHE_MAX_ITEMS)
-        self._sem = asyncio.Semaphore(GLOBAL_TTS_CONCURRENCY)
-
-    async def start(self):
-        if not self._session:
-            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
-
-    async def close(self):
-        if self._session:
-            await self._session.close()
-            self._session = None
-
-    async def synth(
-        self,
-        text: str,
-        voice_name: str = DEFAULT_VOICE,
-        language_code: str = DEFAULT_LANG,
-        speaking_rate: float = DEFAULT_RATE,
-        audio_encoding: str = "OGG_OPUS"
-    ) -> bytes:
-        # Voice-family detection (string heuristic, no canonicalization)
-        vlow = (voice_name or "").lower()
-        is_chirp_or_journey = ("-chirp" in vlow) or ("-journey" in vlow)
-
-        # Cache key should reflect whether we included rate or not
-        eff_rate = 1.0 if is_chirp_or_journey else float(speaking_rate)
-        key = (f"{language_code}:{voice_name}:{text}", audio_encoding, eff_rate)
-        cached = self._cache.get((key[0], key[1], key[2]))
-        if cached is not None:
-            return cached
-
-        if not self._session:
-            await self.start()
-
-        # Build payload; omit speakingRate for Chirp/Journey
-        audio_cfg = {"audioEncoding": audio_encoding}
-        if not is_chirp_or_journey:
-            audio_cfg["speakingRate"] = eff_rate
-
-        payload = {
-            "input": {"text": text},
-            "voice": {"languageCode": language_code, "name": voice_name},
-            "audioConfig": audio_cfg
-        }
-
-        url = GOOGLE_TTS_ENDPOINT.format(api_key=self.api_key)
-        async with self._sem:
-            async with self._session.post(url, json=payload) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    raise RuntimeError(f"Google TTS error {resp.status}: {body[:500]}")
-                data = await resp.json()
-
-        audio_b64 = data.get("audioContent")
-        if not audio_b64:
-            raise RuntimeError("Google TTS response missing audioContent")
-        audio_bytes = base64.b64decode(audio_b64)
-        self._cache.put((key[0], key[1], key[2]), audio_bytes)
-        return audio_bytes
+def _transcode_to_ogg_opus(audio: bytes) -> bytes:
+    """Gemini returns WAV; voicelines are stored as OGG/Opus like everything else."""
+    proc = subprocess.run(
+        [FFMPEG_BIN, "-nostdin", "-loglevel", "error", "-i", "pipe:0",
+         "-c:a", "libopus", "-b:a", "48k", "-f", "ogg", "pipe:1"],
+        input=audio, capture_output=True, check=True,
+    )
+    return proc.stdout
 
 
 # ==========================
@@ -461,6 +392,67 @@ class GuildVoiceSession():
                 pass
 
 # ==========================
+# Voice design picker
+# ==========================
+class _DesignPickView(discord.ui.View):
+    """Buttons under a !narrate design result: pick a candidate (author only) or cancel."""
+    def __init__(self, cog: "NarrationCog", ctx: commands.Context, description: str, candidates: List[dict]):
+        super().__init__(timeout=DESIGN_VIEW_TIMEOUT)
+        self.cog = cog
+        self.ctx = ctx
+        self.description = description
+        self.candidates = candidates
+        self.message: Optional[discord.Message] = None
+        for i in range(len(candidates)):
+            btn = discord.ui.Button(label=f"Use {i + 1}", style=discord.ButtonStyle.primary)
+            btn.callback = self._make_pick(i)
+            self.add_item(btn)
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
+        cancel.callback = self._cancel
+        self.add_item(cancel)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("Only the person who designed this voice can pick it.", ephemeral=True)
+            return False
+        return True
+
+    def _disable_all(self):
+        for item in self.children:
+            item.disabled = True
+        self.stop()
+
+    def _make_pick(self, index: int):
+        async def pick(interaction: discord.Interaction):
+            self._disable_all()
+            await interaction.response.edit_message(view=self)
+            try:
+                ref = await self.cog._save_designed_voice(self.ctx, self.description, self.candidates[index])
+            except Exception as e:
+                print(f"[narrate] saving designed voice failed: {e}")
+                await interaction.followup.send("Couldn't save that voice; try designing again.", suppress_embeds=True)
+                return
+            await interaction.followup.send(
+                f"Voice {index + 1} is now your voice: **{self.description[:100]}** (`{ref}`).",
+                suppress_embeds=True,
+            )
+        return pick
+
+    async def _cancel(self, interaction: discord.Interaction):
+        self._disable_all()
+        await interaction.response.edit_message(content="Voice design cancelled.", view=self)
+
+    async def on_timeout(self):
+        if self.message:
+            for item in self.children:
+                item.disabled = True
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+# ==========================
 # Cog
 # ==========================
 class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
@@ -479,9 +471,14 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.tts = GoogleTTSProvider(google_narrate_key)
+        self.fish = FishTTSProvider(fish_api_key, FISH_MODEL) if fish_api_key else None
+        self.gemini = GeminiTTSProvider(gemini_api_key, GEMINI_MODEL, GEMINI_RPM) if gemini_api_key else None
+        self.budget = BudgetTracker(lambda: self.db, TTS_MONTHLY_BUDGET_USD)
+        self.router = TTSRouter(self.tts, self.fish, self.gemini, self.budget,
+                                reference_loader=self._load_designed_sample)
         self.guild_sessions: Dict[int, GuildVoiceSession] = {}
-        # guild_id, user_id, text_to_narrate, voice, language_code, rate, channel
-        self._narrate_queue: asyncio.Queue[tuple[int, int, str, str, str, float, int]] = asyncio.Queue()
+        # guild_id, user_id, text_to_narrate, voice ref, style, rate, channel
+        self._narrate_queue: asyncio.Queue[tuple[int, int, str, str, Optional[str], float, int]] = asyncio.Queue()
         self._guild_locks: Dict[int, asyncio.Lock] = {}
         self._workers: list[asyncio.Task] = [
             asyncio.create_task(self._narrate_worker(), name=f"narrate:{i}")
@@ -489,7 +486,11 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         ]
         self.guild_voiceline_caches: Dict[int, Dict[str, str]] = {}
         self.persistent_audio_root = "data/audio"
-        self._last_narrated_audio: Dict[Tuple[int, int], bytes] = {}
+        # (guild_id, user_id) -> (audio bytes, format) of the most recent clip, for !narrate save
+        self._last_narrated_audio: Dict[Tuple[int, int], Tuple[bytes, str]] = {}
+        # (guild_id, reason) -> (month, monotonic time) of the last fallback notice
+        self._fallback_notices: Dict[Tuple[int, str], Tuple[date, float]] = {}
+        self._design_last_used: Dict[int, float] = {}
 
     async def cog_load(self):
         try:
@@ -529,7 +530,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 except asyncio.QueueEmpty:
                     pass
             try:
-                await self.tts.close()
+                await self.router.close()
             except Exception:
                 pass
                 
@@ -554,30 +555,42 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     # ---------- DB Helpers ----------
     async def _get_pref(self, guild_id: int, user_id: int) -> Optional[dict]:
         row = await self.db.fetchrow("""
-            SELECT guild_id, user_id, text_channel_id, voice, rate, enabled
+            SELECT guild_id, user_id, text_channel_id, voice, voice_label, style, rate, enabled
             FROM narrate_prefs
             WHERE guild_id=$1 AND user_id=$2""",
             guild_id, user_id
         )
         return dict(row) if row else None
 
-    async def _upsert_pref(self, ctx, text_channel_id, voice, rate, enabled):
+    async def _upsert_pref(self, ctx, text_channel_id, voice, rate, enabled, voice_label=None):
+        """voice_label=None keeps the stored label unless the voice itself changes."""
         guild_id = await get_guild_id(ctx, self.db)
         user_id  = await get_user_id(ctx, self.db)
         if guild_id is None or user_id is None:
             return  # helpers already messaged on DB error
             
         await self.db.execute("""
-            INSERT INTO narrate_prefs (guild_id, user_id, text_channel_id, voice, rate, enabled)
-            VALUES ($1,$2,$3,$4,$5,$6)
+            INSERT INTO narrate_prefs (guild_id, user_id, text_channel_id, voice, voice_label, rate, enabled)
+            VALUES ($1,$2,$3,$4,$5,$6,$7)
             ON CONFLICT (guild_id, user_id)
             DO UPDATE SET text_channel_id=EXCLUDED.text_channel_id,
                           voice=EXCLUDED.voice,
+                          voice_label=CASE
+                              WHEN narrate_prefs.voice IS DISTINCT FROM EXCLUDED.voice THEN EXCLUDED.voice_label
+                              ELSE COALESCE(EXCLUDED.voice_label, narrate_prefs.voice_label) END,
                           rate=EXCLUDED.rate,
                           enabled=EXCLUDED.enabled,
                           updated_at=CURRENT_TIMESTAMP
             """,
-            guild_id, user_id, text_channel_id, voice, rate, enabled
+            guild_id, user_id, text_channel_id, voice, voice_label, rate, enabled
+        )
+
+    async def _set_style(self, guild_id: int, user_id: int, style: Optional[str]) -> None:
+        await self.db.execute("""
+            UPDATE narrate_prefs
+            SET style=$3, updated_at=CURRENT_TIMESTAMP
+            WHERE guild_id=$1 AND user_id=$2""",
+            guild_id, user_id, style
         )
         
     async def _set_enabled(self, guild_id: int, user_id: int, enabled: bool) -> None:
@@ -968,14 +981,21 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "  !narrate status\n"
             "  !narrate cancel   (alias: !narrate x)\n"
             "  !narrate channel [#text-channel|thread]\n"
-            "  !narrate voice <voice-name|short-name>\n"
-            "  !narrate voices [language] [gender]\n"
+            "  !narrate voice <fish voice link|gemini:name|google voice-name|short-name>\n"
+            "  !narrate voices [language] [gender]   (no args: where to find voices)\n"
+            "  !narrate style <delivery|off>       (default style, e.g. 'dry and sarcastic')\n"
+            "  !narrate design <description>       (create a brand-new voice)\n"
+            "  !narrate designs                    (your designed voices)\n"
             "  !narrate rate <float>\n"
+            "  !narrate usage                      (this month's TTS spend)\n"
             "  !narrate save <voiceline-name>      (saves your most recently narrated audio)\n"
             "  !narrate list                       (lists saved voicelines for this server)\n"
             "  !narrate rename <old> <new>\n"
             "  !narrate delete <voiceline-name>\n"
-            "  !narrate shutoff"
+            "  !narrate shutoff\n"
+            "\n"
+            "Tip: start a message with [whispering] / [excited] / [very sad] etc. to set how it's read,\n"
+            "and use [laugh] [sigh] [gasp] [pause] anywhere (Fish & Gemini voices only)."
         )
         await ctx.send(usage, suppress_embeds=True)
 
@@ -984,7 +1004,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         ch = ctx.channel  # could be a TextChannel or a Thread
         if not await self._set_channel_pref(ctx, ch, enable=True):
             return
-        await self.tts.start()
+        await self.router.start()
         session = self._get_session(ctx.guild.id)
         if ctx.author.voice and ctx.author.voice.channel:
             await session.ensure_connected(ctx.author.voice.channel)
@@ -1010,19 +1030,28 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
     @narrate_root.command(name="voices")
     async def narrate_voices(self, ctx: commands.Context, language: Optional[str] = None, gender: Optional[str] = None):
-        url = "https://cloud.google.com/text-to-speech/docs/voices"
+        url = GOOGLE_VOICES_URL
 
-        # No args: show link + languages (comma-separated)
+        # No args: where to browse each provider's voices
         if not language:
-            rows = await self.db.fetch(
-                "SELECT DISTINCT language FROM google_tts_voices ORDER BY language"
+            parts = ["**Where to find voices**"]
+            if self.fish:
+                parts.append(
+                    f"**Fish Audio** (expressive, huge community library): <{FISH_LIBRARY_URL}>\n"
+                    f"  Open a voice, copy its link, then `!narrate voice <link>`"
+                )
+            if self.gemini:
+                parts.append(
+                    f"**Gemini** (best at following [style] hints): <{GEMINI_VOICES_URL}>\n"
+                    f"  `!narrate voice gemini:<name>` e.g. `!narrate voice gemini:Kore`"
+                )
+            parts.append(
+                f"**Google** (free, no emotion): <{url}>\n"
+                f"  `!narrate voice <full voice name>` or `!narrate voices <language> [male/female]` for short names"
             )
-            langs = ", ".join(r["language"] for r in rows) if rows else "(no data)"
-            return await ctx.send(
-                f"This command helps you pick a voice.\n"
-                f"Once you pick a voice, you can set it with `!narrate voice voice-name`\n"
-                f"You can either get a voice-name by copying a full voice name from this website:\n {url}\n Or you can get a list of available voices by calling\n"
-                f"`!narrate voices language male/female`\n Valid language options: {langs}", suppress_embeds=True)
+            if self.fish:
+                parts.append("Or invent one: `!narrate design <description>`")
+            return await ctx.send("\n".join(parts), suppress_embeds=True)
 
         # With filters
         lang_in = _collapse_ws(language)
@@ -1071,7 +1100,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     async def narrate_status(self, ctx: commands.Context):
         rows = await self.db.fetch(
             """
-            SELECT user_id, voice, rate
+            SELECT user_id, voice, voice_label, style, rate
             FROM narrate_prefs
             WHERE guild_id=$1 AND enabled=TRUE
             ORDER BY user_id
@@ -1094,10 +1123,11 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 uid = r["user_id"]
                 member = ctx.guild.get_member(uid)
                 username = (member.display_name if member else f"<@{uid}>")
-                v = r["voice"] or DEFAULT_VOICE
+                v = _voice_display(r["voice"] or DEFAULT_VOICE, r["voice_label"])
                 rate_val = r["rate"]
                 rate_str = f"{DEFAULT_RATE if rate_val is None else rate_val}"
-                lines.append(f"- {username} | {v} | {rate_str}")
+                style_str = f" | style: {r['style']}" if r["style"] else ""
+                lines.append(f"- {username} | {v} | {rate_str}{style_str}")
 
         await ctx.send("\n".join(lines), suppress_embeds=True)
 
@@ -1110,7 +1140,39 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
     @narrate_root.command(name="voice")
     async def narrate_voice(self, ctx: commands.Context, *, voice: str):
-        q = _collapse_ws(voice)
+        q = _collapse_ws(voice).strip("<>")
+        low = q.lower()
+
+        # A locally kept designed voice: fish:ref:<key> (from !narrate designs)
+        if low.startswith(f"fish:{FISH_REF_PREFIX}"):
+            row = await self.db.fetchrow(
+                "SELECT title FROM tts_designed_voices WHERE provider='fish' AND voice_id=$1",
+                low[len("fish:"):],
+            )
+            if not row:
+                return await ctx.send("No designed voice with that id. `!narrate designs` lists yours.", suppress_embeds=True)
+            return await self._apply_voice(ctx, low, row["title"], "Fish Audio, designed")
+
+        # Fish: fish:<id>, a fish.audio link, or a bare 32-hex model id
+        looks_fish =low.startswith("fish:") or "fish.audio" in low or re.fullmatch(r"[0-9a-f]{32}", low)
+        if looks_fish:
+            if not self.fish:
+                return await ctx.send("Fish Audio isn't set up on this bot.", suppress_embeds=True)
+            fish_id = extract_fish_id(q)
+            if not fish_id:
+                return await ctx.send("That doesn't look like a Fish voice link or id.", suppress_embeds=True)
+            try:
+                info = await self.fish.get_model(fish_id)
+            except Exception as e:
+                print(f"[narrate] fish model lookup failed: {e}")
+                return await ctx.send("Couldn't reach Fish Audio to check that voice; try again shortly.", suppress_embeds=True)
+            if not info:
+                return await ctx.send("Fish Audio doesn't have a voice with that id (or it's private).", suppress_embeds=True)
+            return await self._apply_voice(ctx, f"fish:{fish_id}", (info.get("title") or fish_id)[:256], "Fish Audio")
+
+        # Gemini: gemini:<name>
+        if low.startswith("gemini:"):
+            return await self._set_gemini_voice(ctx, q[7:].strip())
 
         # 1) Try exact (case-insensitive) full voice_name
         row = await self.db.fetchrow(
@@ -1136,9 +1198,15 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             )
 
         if not row:
+            # A bare Gemini voice name (Google names/nicknames win when both exist)
+            if self.gemini:
+                try:
+                    if await self.gemini.find_voice(q):
+                        return await self._set_gemini_voice(ctx, q)
+                except Exception as e:
+                    print(f"[narrate] gemini voice lookup failed: {e}")
             return await ctx.send(
-                "Unknown voice. Try `!narrate voices [language] [gender]` or use the full list:\n"
-                "https://cloud.google.com/text-to-speech/docs/voices",
+                "Unknown voice. `!narrate voices` shows where to find Fish, Gemini and Google voices.",
                 suppress_embeds=True,
             )
 
@@ -1152,13 +1220,194 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         enabled    = bool(pref.get("enabled")) if pref else False
 
         # Persist the full name in prefs (what TTS needs)
-        await self._upsert_pref(ctx, channel_id, voice_name, rate, enabled)
+        await self._upsert_pref(ctx, channel_id, voice_name, rate, enabled, voice_label=nickname or None)
 
         # Friendly confirmation shows both full name and nickname
         await ctx.send(
             f"Voice set to `{voice_name}` (`{nickname}`) - {language}.",
             suppress_embeds=True,
         )
+
+    async def _apply_voice(self, ctx: commands.Context, ref: str, label: str, provider_name: str):
+        pref = await self._get_pref(ctx.guild.id, ctx.author.id)
+        channel_id = (pref.get("text_channel_id") if pref else None) or ctx.channel.id
+        rate       = float((pref.get("rate") if pref else None) or DEFAULT_RATE)
+        enabled    = bool(pref.get("enabled")) if pref else False
+        await self._upsert_pref(ctx, channel_id, ref, rate, enabled, voice_label=label)
+        await ctx.send(f"Voice set to **{label}** ({provider_name}).", suppress_embeds=True)
+
+    async def _set_gemini_voice(self, ctx: commands.Context, name: str):
+        if not self.gemini:
+            return await ctx.send("Gemini TTS isn't set up on this bot.", suppress_embeds=True)
+        try:
+            v = await self.gemini.find_voice(name)
+        except Exception as e:
+            print(f"[narrate] gemini voice lookup failed: {e}")
+            return await ctx.send("Couldn't reach Gemini to check that voice; try again shortly.", suppress_embeds=True)
+        if not v:
+            return await ctx.send(f"Gemini has no voice called `{name}`. See <{GEMINI_VOICES_URL}>.", suppress_embeds=True)
+        label = v.get("display_name") or v["id"]
+        desc = f": {v['description']}" if v.get("description") else ""
+        await self._apply_voice(ctx, f"gemini:{v['id'].lower()}", label[:256], f"Gemini{desc}"[:300])
+
+    @narrate_root.command(name="style")
+    async def narrate_style(self, ctx: commands.Context, *, style: str):
+        """Default delivery style for your messages (Fish & Gemini voices). 'off' clears it."""
+        style = _collapse_ws(style).strip("[]")
+        clear = style.lower() in {"off", "none", "clear", "reset"}
+        pref = await self._get_pref(ctx.guild.id, ctx.author.id)
+        if not pref:
+            # Create the row (with defaults) so there's somewhere to store the style
+            await self._upsert_pref(ctx, ctx.channel.id, DEFAULT_VOICE, DEFAULT_RATE, False)
+        await self._set_style(ctx.guild.id, ctx.author.id, None if clear else style[:200])
+        if clear:
+            return await ctx.send("Default style cleared.", suppress_embeds=True)
+        provider = parse_voice_ref((pref or {}).get("voice") or DEFAULT_VOICE)[0]
+        note = "" if provider != "google" else " (your current voice is a Google voice, which ignores styles)"
+        await ctx.send(f"Default style set to **{style[:200]}**{note}. Starting a message with `[...]` overrides it.",
+                       suppress_embeds=True)
+
+    @narrate_root.command(name="usage")
+    @commands.has_permissions(manage_guild=True)
+    async def narrate_usage(self, ctx: commands.Context):
+        totals = await self.budget.by_provider()
+        spent = sum(totals.values())
+        lines = [f"**TTS spend this month:** ${spent:.2f} of ${self.budget.cap:.2f} (estimated, all servers)"]
+        for prov, usd in sorted(totals.items()):
+            lines.append(f"- {prov}: ${usd:.3f}")
+        if spent >= self.budget.cap:
+            lines.append("Budget reached: paid voices are using the Google voice until next month.")
+        await ctx.send("\n".join(lines), suppress_embeds=True)
+
+    @narrate_root.command(name="design")
+    async def narrate_design(self, ctx: commands.Context, *, description: str):
+        """Create a new Fish voice from a text description; pick one of 3 candidates."""
+        if not self.fish:
+            return await ctx.send("Voice design needs Fish Audio, which isn't set up on this bot.", suppress_embeds=True)
+        description = _collapse_ws(description)
+        if len(description) < 5:
+            return await ctx.send("Describe the voice, e.g. `!narrate design raspy old pirate, slow and amused`.",
+                                  suppress_embeds=True)
+        now = time.monotonic()
+        last = self._design_last_used.get(ctx.author.id)
+        if last and now - last < DESIGN_COOLDOWN_SECS:
+            return await ctx.send(f"Give it {int(DESIGN_COOLDOWN_SECS - (now - last)) + 1}s before designing another voice.",
+                                  suppress_embeds=True)
+        if await self.budget.exhausted():
+            return await ctx.send("This month's TTS budget is used up, so voice design is off until next month.",
+                                  suppress_embeds=True)
+        guild_id = await get_guild_id(ctx, self.db)
+        user_id = await get_user_id(ctx, self.db)
+        if guild_id is None or user_id is None:
+            return
+        self._design_last_used[ctx.author.id] = now
+
+        async with ctx.typing():
+            try:
+                candidates = await self.fish.design(description, DESIGN_PREVIEW_LINE, n=3)
+            except Exception as e:
+                print(f"[narrate] voice design failed: {e}")
+                return await ctx.send("Voice design failed; try a different description.", suppress_embeds=True)
+        await self.budget.record("fish", FISH_VOICE_DESIGN_USD)
+        candidates = [c for c in candidates if c.get("audio")]
+        if not candidates:
+            return await ctx.send("Fish didn't return any voices for that; try rewording it.", suppress_embeds=True)
+
+        files = []
+        for i, c in enumerate(candidates, 1):
+            ext = {"wav": "wav", "ogg_opus": "ogg", "mp3": "mp3"}.get(audio_format(c["audio"]), "wav")
+            files.append(discord.File(io.BytesIO(c["audio"]), filename=f"voice_{i}.{ext}"))
+        view = _DesignPickView(self, ctx, description, candidates)
+        view.message = await ctx.send(
+            f"Here are {len(candidates)} takes on **{description[:200]}**. Listen, then pick one to make it your voice:",
+            files=files, view=view, suppress_embeds=True,
+        )
+
+    async def _save_designed_voice(self, ctx: commands.Context, description: str, candidate: dict) -> str:
+        """
+        Make a design candidate the user's voice; returns its voice ref.
+
+        Prefers a private Fish model. Fish caps API model creation by prepaid credit, so when that's
+        refused the sample is kept on disk instead and sent inline with each request (fish:ref:<key>).
+        """
+        title = description[:100]
+        sample_text = candidate.get("text") or DESIGN_PREVIEW_LINE
+        sample_path = None
+        try:
+            info = await self.fish.create_model(
+                title=title, audio=candidate["audio"], text=sample_text,
+                signature=candidate.get("signature") or candidate.get("id"), description=description,
+            )
+            voice_id = str(info["_id"]).lower()
+        except ProviderError as e:
+            if e.status not in (402, 403):
+                raise
+            print(f"[narrate] fish model creation refused, keeping designed voice locally: {e}")
+            key = uuid.uuid4().hex
+            sample_path = f"designed/{ctx.guild.id}/{key}.ogg"
+            audio = candidate["audio"]
+            if audio_format(audio) != "ogg_opus":
+                audio = await asyncio.to_thread(_transcode_to_ogg_opus, audio)
+            root = Path(getattr(self, "persistent_audio_root", "data/audio"))
+            await asyncio.to_thread(_atomic_write_bytes, root / sample_path, audio)
+            voice_id = f"{FISH_REF_PREFIX}{key}"
+
+        await self.db.execute(
+            """
+            INSERT INTO tts_designed_voices (guild_id, user_id, provider, voice_id, title, instruction,
+                                             sample_path, sample_text)
+            VALUES ($1, $2, 'fish', $3, $4, $5, $6, $7)
+            ON CONFLICT (provider, voice_id) DO NOTHING
+            """,
+            ctx.guild.id, ctx.author.id, voice_id, title, description, sample_path, sample_text,
+        )
+        ref = f"fish:{voice_id}"
+        pref = await self._get_pref(ctx.guild.id, ctx.author.id)
+        channel_id = (pref.get("text_channel_id") if pref else None) or ctx.channel.id
+        rate       = float((pref.get("rate") if pref else None) or DEFAULT_RATE)
+        enabled    = bool(pref.get("enabled")) if pref else False
+        await self._upsert_pref(ctx, channel_id, ref, rate, enabled, voice_label=title)
+        return ref
+
+    async def _load_designed_sample(self, key: str) -> Optional[Tuple[bytes, str]]:
+        """Router callback for fish:ref:<key> voices: (ogg sample, transcript), or None."""
+        row = await self.db.fetchrow(
+            """
+            SELECT sample_path, sample_text
+            FROM tts_designed_voices
+            WHERE provider='fish' AND voice_id=$1 AND sample_path IS NOT NULL
+            """,
+            f"{FISH_REF_PREFIX}{key}",
+        )
+        if not row:
+            return None
+        p = Path(getattr(self, "persistent_audio_root", "data/audio")) / row["sample_path"]
+        try:
+            audio = await asyncio.to_thread(p.read_bytes)
+        except OSError as e:
+            print(f"[narrate] designed voice sample missing at {p}: {e}")
+            return None
+        return audio, row["sample_text"] or DESIGN_PREVIEW_LINE
+
+    @narrate_root.command(name="designs")
+    async def narrate_designs(self, ctx: commands.Context):
+        rows = await self.db.fetch(
+            """
+            SELECT voice_id, title, created_at
+            FROM tts_designed_voices
+            WHERE guild_id=$1 AND user_id=$2
+            ORDER BY created_at DESC
+            LIMIT 25
+            """,
+            ctx.guild.id, ctx.author.id,
+        )
+        if not rows:
+            return await ctx.send("You haven't designed any voices yet. Try `!narrate design <description>`.",
+                                  suppress_embeds=True)
+        lines = ["Your designed voices (use with `!narrate voice fish:<id>`):"]
+        for r in rows:
+            lines.append(f"- **{r['title']}**: `fish:{r['voice_id']}`")
+        await ctx.send("\n".join(lines)[:1900], suppress_embeds=True)
 
     @narrate_root.command(name="rate")
     async def narrate_rate(self, ctx: commands.Context, *, rate: float):
@@ -1279,16 +1528,18 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             return
 
         cleaned = _strip_parenthetical_for_tts(_clean_content(message.content or ""))
+        # A leading [style] sets delivery for this message; otherwise the user's default style applies
+        msg_style, cleaned = split_leading_style(cleaned)
         if not cleaned:
             return
 
         voice = (pref.get("voice") or DEFAULT_VOICE)
-        language_code = "-".join(voice.split("-")[0:2]) if "-" in voice else DEFAULT_LANG
+        style = msg_style or pref.get("style")
         try:
             rate = float(pref.get("rate") if pref.get("rate") is not None else DEFAULT_RATE)
         except Exception:
             rate = DEFAULT_RATE
-        await self._narrate_queue.put((message.guild.id, message.author.id, cleaned, voice, language_code, rate, message.channel.id))
+        await self._narrate_queue.put((message.guild.id, message.author.id, cleaned, voice, style, rate, message.channel.id))
 
     @narrate_root.command(name="save")
     async def narrate_save(self, ctx: commands.Context, *, voiceline_name: str):
@@ -1297,12 +1548,19 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if guild_id is None or user_id is None:
             return
 
-        audio = self._last_narrated_audio.get((guild_id, user_id))
-        if not audio:
+        last = self._last_narrated_audio.get((guild_id, user_id))
+        if not last:
             return await ctx.send(
                 "No recent narrated audio found for you in this server.",
                 suppress_embeds=True,
             )
+        audio, fmt = last
+        if fmt != "ogg_opus":
+            try:
+                audio = await asyncio.to_thread(_transcode_to_ogg_opus, audio)
+            except Exception as e:
+                print(f"[narrate] voiceline transcode failed: {e}")
+                return await ctx.send("Failed to save voiceline: couldn't convert the audio.", suppress_embeds=True)
 
         try:
             saved = await self._save_voiceline(
@@ -1379,10 +1637,30 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
         await ctx.send(f"Deleted voiceline `{name}`.", suppress_embeds=True)
 
+    async def _notify_fallback(self, guild: discord.Guild, channel_id: int, reason: str) -> None:
+        """Tell the channel a paid voice fell back to Google, without repeating it every message."""
+        notice, cooldown = FALLBACK_NOTICES.get(reason, FALLBACK_NOTICES["error"])
+        month = date.today().replace(day=1)
+        now = time.monotonic()
+        prev = self._fallback_notices.get((guild.id, reason))
+        if prev:
+            prev_month, prev_t = prev
+            if cooldown is None and prev_month == month:
+                return
+            if cooldown is not None and now - prev_t < cooldown:
+                return
+        self._fallback_notices[(guild.id, reason)] = (month, now)
+        ch = guild.get_channel(channel_id)
+        if ch:
+            try:
+                await ch.send(notice, suppress_embeds=True)
+            except Exception:
+                pass
+
     async def _narrate_worker(self):
         try:
             while True:
-                guild_id, user_id, text, voice, language_code, rate, channel_id = await self._narrate_queue.get()
+                guild_id, user_id, text, voice, style, rate, channel_id = await self._narrate_queue.get()
                 try:
                     if not text:
                         continue
@@ -1422,24 +1700,21 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                             continue
 
                         if voiceline_data:
-                            self._last_narrated_audio[(guild_id, user_id)] = voiceline_data
+                            self._last_narrated_audio[(guild_id, user_id)] = (voiceline_data, "ogg_opus")
                             await session.enqueue(voiceline_data)
                         else:
                             # NO voiceline data -- do normal tts api call
-                            chunks = chunk_text(text, MAX_CHARS_PER_CHUNK)
+                            chunks = chunk_text(text, self.router.chunk_limit(voice))
                             if not chunks:
                                 continue
 
-                            async def synth_chunk(t: str) -> bytes:
-                                return await self.tts.synth(
-                                    t, voice_name=voice, language_code=language_code, speaking_rate=rate
-                                )
-
                             try:
                                 for part in chunks:
-                                    data = await synth_chunk(part)
-                                    self._last_narrated_audio[(guild_id, user_id)] = data
-                                    await session.enqueue(data)
+                                    res = await self.router.synth(voice, part, style=style, rate=rate)
+                                    if res.fallback_reason:
+                                        await self._notify_fallback(guild, channel_id, res.fallback_reason)
+                                    self._last_narrated_audio[(guild_id, user_id)] = (res.audio, res.fmt)
+                                    await session.enqueue(res.audio)
                             except Exception as e:
                                 ch = guild.get_channel(channel_id)
                                 if ch:

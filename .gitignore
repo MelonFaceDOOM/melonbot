@@ -13,5 +13,7 @@ data/message_archive_status.json
 data/message_archive/
 # Style-model JSONL exports
 data/style_export/
+# TTS provider comparison runs
+data/tts_compare/
 *.ogg
 log.txt

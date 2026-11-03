@@ -129,3 +129,23 @@ ORDER BY table_name;
 4. Watch the status JSON / SQL counts — nothing is announced in Discord.
 
 **Rollback:** drop schema `message_archive` only if you are sure nothing depends on it (`DROP SCHEMA message_archive CASCADE`).
+
+---
+
+## Multi-provider narration (`migration_2026_11_03_tts_providers.py`)
+
+Adds Fish Audio and Gemini TTS alongside Google for `!narrate`:
+
+- `narrate_prefs.voice_label` (display name for Fish/Gemini voices), `narrate_prefs.style` (default delivery style)
+- `tts_usage` — month-to-date estimated spend per paid provider; narration falls back to Google once the shared `TTS_MONTHLY_BUDGET_USD` cap is reached
+- `tts_designed_voices` — voices created with `!narrate design`
+
+`narrate_prefs.voice` now holds a voice ref: `fish:<model id>`, `gemini:<voice id>`, or a Google voice name (unchanged, so existing prefs keep working).
+
+### Migrate runbook
+
+1. `.env`: set `FISH_API_KEY`, `GEMINI_API_KEY`, and optionally `FISH_DEFAULT_VOICE_ID` (see `.env.example`).
+2. Dev: `MELONBOT_DB=dev python migrations/migration_2026_11_03_tts_providers.py`, restart the dev bot, test `!narrate voice`, `!narrate style`, `!narrate design`, `!narrate usage`.
+3. Prod: same script with `MELONBOT_DB=prod`, then restart the prod bot.
+
+**Rollback:** additive only. The old code ignores the new columns, but would read `fish:`/`gemini:` refs as Google voice names, so reset those first: `UPDATE narrate_prefs SET voice=NULL WHERE voice LIKE 'fish:%' OR voice LIKE 'gemini:%'`.

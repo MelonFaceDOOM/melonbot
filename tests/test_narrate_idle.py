@@ -8,6 +8,13 @@ from unittest.mock import AsyncMock, Mock, patch
 # Import the narration code without loading operator credentials from config/.env.
 config = types.ModuleType("config")
 config.google_narrate_key = "test-key"
+config.fish_api_key = ""
+config.gemini_api_key = ""
+config.FISH_DEFAULT_VOICE_ID = ""
+config.FISH_MODEL = "s2.1-pro"
+config.GEMINI_MODEL = "gemini-3.8-flash-tts"
+config.GEMINI_RPM = 9
+config.TTS_MONTHLY_BUDGET_USD = 10.0
 with patch.dict(sys.modules, {"config": config}):
     import bot_narrate
 

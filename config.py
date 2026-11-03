@@ -109,6 +109,15 @@ gapikey = os.environ.get("GOOGLE_API_KEY", "")
 gcsekey = os.environ.get("GOOGLE_CSE_KEY", "")
 google_narrate_key = os.environ.get("GOOGLE_NARRATE_KEY", "")
 
+# Narration TTS providers (Fish is the default for new users; Google is the free fallback)
+fish_api_key = os.environ.get("FISH_API_KEY", "")
+gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+FISH_DEFAULT_VOICE_ID = os.environ.get("FISH_DEFAULT_VOICE_ID", "").strip()
+FISH_MODEL = os.environ.get("FISH_MODEL", "s2.1-pro").strip() or "s2.1-pro"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash-tts").strip() or "gemini-3.8-flash-tts"
+GEMINI_RPM = int(os.environ.get("GEMINI_RPM", "9") or 9)
+TTS_MONTHLY_BUDGET_USD = float(os.environ.get("TTS_MONTHLY_BUDGET_USD", "10") or 10)
+
 SFTP_CREDENTIALS = {
     "host": os.environ.get("SFTP_HOST", ""),
     "port": int(os.environ.get("SFTP_PORT", "22")),

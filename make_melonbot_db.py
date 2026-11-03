@@ -105,6 +105,40 @@ def make_db():
     cur.execute("""CREATE INDEX IF NOT EXISTS narrate_prefs_text_channel_idx
                 ON narrate_prefs (text_channel_id)""")
 
+    # Multi-provider narration (also migrations/migration_2026_11_03_tts_providers.py)
+    cur.execute("""
+        ALTER TABLE narrate_prefs
+          ADD COLUMN IF NOT EXISTS voice_label VARCHAR(256),
+          ADD COLUMN IF NOT EXISTS style       VARCHAR(200)""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS tts_usage (
+                month     DATE NOT NULL,
+                provider  VARCHAR(16) NOT NULL,
+                requests  INTEGER NOT NULL DEFAULT 0,
+                chars     BIGINT NOT NULL DEFAULT 0,
+                audio_ms  BIGINT NOT NULL DEFAULT 0,
+                est_usd   NUMERIC(12,6) NOT NULL DEFAULT 0,
+                PRIMARY KEY (month, provider))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS tts_designed_voices (
+                id          BIGSERIAL PRIMARY KEY,
+                guild_id    BIGINT NOT NULL,
+                user_id     BIGINT,
+                provider    VARCHAR(16) NOT NULL,
+                voice_id    VARCHAR(128) NOT NULL,
+                title       VARCHAR(128) NOT NULL,
+                instruction TEXT,
+                sample_path TEXT,
+                sample_text TEXT,
+                created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id)  REFERENCES users  (id) ON DELETE SET NULL,
+                UNIQUE (provider, voice_id))""")
+    cur.execute("""
+        ALTER TABLE tts_designed_voices
+          ADD COLUMN IF NOT EXISTS sample_path TEXT,
+          ADD COLUMN IF NOT EXISTS sample_text TEXT""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS tts_designed_voices_user_idx
+                ON tts_designed_voices (guild_id, user_id)""")
+
     # Message archive schema (also migrations/migration_2026_08_10_message_archive.py)
     cur.execute("""CREATE SCHEMA IF NOT EXISTS message_archive""")
     cur.execute("""
