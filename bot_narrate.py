@@ -4,6 +4,7 @@ from pathlib import Path
 import time
 import io
 import math
+import traceback
 import subprocess
 from datetime import date, timedelta
 from typing import Optional, Dict, Tuple, List, Union
@@ -49,6 +50,8 @@ DESIGN_COOLDOWN_SECS = 60                   # per user, for !narrate design
 DESIGN_PREVIEW_LINE = ("Hey everyone, it's me. I have some news, and honestly, you are not going to believe it. "
                        "Pull up a chair, because this one is a long story.")
 DESIGN_VIEW_TIMEOUT = 600
+# narrate subcommands that also work in a DM with the bot (designing a voice privately)
+DM_COMMANDS = frozenset({"narrate", "design", "designs"})
 
 FISH_LIBRARY_URL = "https://fish.audio/voice-library/"
 GEMINI_VOICES_URL = "https://cloud.google.com/text-to-speech/docs/gemini-tts"
@@ -449,11 +452,14 @@ class GuildVoiceSession():
 # Voice design picker
 # ==========================
 class _DesignPickView(discord.ui.View):
-    """Buttons under a !narrate design result: pick a candidate (author only) or cancel."""
-    def __init__(self, cog: "NarrationCog", ctx: commands.Context, description: str, candidates: List[dict]):
+    """Buttons under a !narrate design result (sent by DM): pick a candidate (designer only) or cancel."""
+    def __init__(self, cog: "NarrationCog", owner_id: int, origin_guild_id: Optional[int], prefix: str,
+                 description: str, candidates: List[dict]):
         super().__init__(timeout=DESIGN_VIEW_TIMEOUT)
         self.cog = cog
-        self.ctx = ctx
+        self.owner_id = owner_id
+        self.origin_guild_id = origin_guild_id
+        self.prefix = prefix
         self.description = description
         self.candidates = candidates
         self.message: Optional[discord.Message] = None
@@ -466,7 +472,7 @@ class _DesignPickView(discord.ui.View):
         self.add_item(cancel)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.ctx.author.id:
+        if interaction.user.id != self.owner_id:
             await interaction.response.send_message("Only the person who designed this voice can pick it.", ephemeral=True)
             return False
         return True
@@ -481,13 +487,16 @@ class _DesignPickView(discord.ui.View):
             self._disable_all()
             await interaction.response.edit_message(view=self)
             try:
-                ref = await self.cog._save_designed_voice(self.ctx, self.description, self.candidates[index])
+                ref = await self.cog._save_designed_voice(self.owner_id, self.origin_guild_id,
+                                                          self.description, self.candidates[index])
             except Exception as e:
                 print(f"[narrate] saving designed voice failed: {e}")
                 await interaction.followup.send("Couldn't save that voice; try designing again.", suppress_embeds=True)
                 return
             await interaction.followup.send(
-                f"Voice {index + 1} is now your voice: **{self.description[:100]}** (`{ref}`).",
+                f"Saved take {index + 1} of **{self.description[:100]}** to your voices. Nobody else has heard it.\n"
+                f"When you're ready, use it in any server with `{self.prefix}narrate voice {ref}` "
+                f"(`{self.prefix}narrate designs` lists all of yours).",
                 suppress_embeds=True,
             )
         return pick
@@ -591,6 +600,20 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         except Exception:
             asyncio.create_task(_cleanup())
 
+    async def cog_check(self, ctx: commands.Context) -> bool:
+        if ctx.guild is None and (ctx.command is None or ctx.command.name not in DM_COMMANDS):
+            raise commands.NoPrivateMessage()
+        return True
+
+    async def cog_command_error(self, ctx: commands.Context, error: Exception):
+        if isinstance(error, commands.NoPrivateMessage):
+            await ctx.send(f"That only works in a server. In a DM with me you can use "
+                           f"`{ctx.clean_prefix}narrate design <description>` and `{ctx.clean_prefix}narrate designs`.")
+            return
+        # Defining this handler stops discord.py's default logging for this cog, so keep printing the rest
+        print(f"Ignoring exception in command {ctx.command}:")
+        traceback.print_exception(type(error), error, error.__traceback__)
+
     async def aclose(self):
         """Called by BottyBoy.close() on shutdown: stop workers and close the TTS HTTP sessions."""
         for t in list(self._guild_workers.values()):
@@ -654,13 +677,14 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 """,
                 month, user_id, round(usd, 6),
             )
-            await self.db.execute(
-                """
-                INSERT INTO tts_guild_usage (month, guild_id, est_usd) VALUES ($1, $2, $3)
-                ON CONFLICT (month, guild_id) DO UPDATE SET est_usd = tts_guild_usage.est_usd + EXCLUDED.est_usd
-                """,
-                month, guild_id, round(usd, 6),
-            )
+            if guild_id is not None:  # designs made in a DM don't belong to any server
+                await self.db.execute(
+                    """
+                    INSERT INTO tts_guild_usage (month, guild_id, est_usd) VALUES ($1, $2, $3)
+                    ON CONFLICT (month, guild_id) DO UPDATE SET est_usd = tts_guild_usage.est_usd + EXCLUDED.est_usd
+                    """,
+                    month, guild_id, round(usd, 6),
+                )
         except Exception as e:
             print(f"[narrate] failed to record spend: {e}")
 
@@ -1116,7 +1140,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "  !narrate voice <fish voice link|gemini:name|google voice-name|short-name>\n"
             "  !narrate voices [language] [gender]   (no args: where to find voices)\n"
             "  !narrate style <delivery|off>       (default style, e.g. 'dry and sarcastic')\n"
-            "  !narrate design <description>       (create a brand-new voice)\n"
+            "  !narrate design <description>       (create a brand-new voice; samples come by DM)\n"
             "  !narrate designs                    (your designed voices)\n"
             "  !narrate recent [n,p] [@someone]    (voices someone has used, newest first)\n"
             "  !narrate rate <float>\n"
@@ -1206,7 +1230,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if self.fish:
             embed.add_field(
                 name="🎨 Make your own",
-                value=f"`{p} design raspy old pirate, slow and amused`, then pick from 3 takes",
+                value=(f"`{p} design raspy old pirate, slow and amused`: I DM you 3 takes to pick from, "
+                       f"privately. Use it here whenever you're ready."),
                 inline=False,
             )
         if self.fish or self.gemini:
@@ -1326,8 +1351,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         # A locally kept designed voice: fish:ref:<key> (from !narrate designs)
         if low.startswith(f"fish:{FISH_REF_PREFIX}"):
             row = await self.db.fetchrow(
-                "SELECT title FROM tts_designed_voices WHERE provider='fish' AND voice_id=$1 AND guild_id=$2",
-                low[len("fish:"):], ctx.guild.id,
+                "SELECT title FROM tts_designed_voices WHERE provider='fish' AND voice_id=$1 "
+                "AND (user_id=$2 OR guild_id=$3)",  # your own designs anywhere; older ones shared per server
+                low[len("fish:"):], ctx.author.id, ctx.guild.id,
             )
             if not row:
                 return await ctx.send(f"No designed voice with that id. `{ctx.clean_prefix}narrate designs` lists yours.", suppress_embeds=True)
@@ -1529,37 +1555,54 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if await self._over_user_share(ctx.author.id):
             return await ctx.send("You've used your share of this month's premium-voice budget, so voice design is off "
                                   "for you until next month.", suppress_embeds=True)
-        guild_id = await get_guild_id(ctx, self.db)
         user_id = await get_user_id(ctx, self.db)
-        if guild_id is None or user_id is None:
+        guild_id = await get_guild_id(ctx, self.db) if ctx.guild else None
+        if user_id is None or (ctx.guild and guild_id is None):
             return
+
+        # Designing is private: the samples and pick buttons always go to the designer's DMs.
+        # Check DMs work before spending anything.
+        try:
+            dm = await ctx.author.create_dm()
+            if ctx.guild:
+                await dm.send(f"Designing **{description[:200]}**, samples coming here in a moment…",
+                              suppress_embeds=True)
+        except discord.Forbidden:
+            return await ctx.send(
+                f"I couldn't DM you. Allow DMs from server members (Privacy Settings), or DM me "
+                f"`{ctx.clean_prefix}narrate design <description>` directly.", suppress_embeds=True)
+        if ctx.guild:
+            await ctx.send("📬 Check your DMs, I'm sending the samples there.", suppress_embeds=True)
         self._design_last_used[ctx.author.id] = now
 
-        async with ctx.typing():
+        async with dm.typing():
             try:
                 candidates = await self.fish.design(description, DESIGN_PREVIEW_LINE, n=3)
             except Exception as e:
                 print(f"[narrate] voice design failed: {e}")
-                return await ctx.send("Voice design failed; try a different description.", suppress_embeds=True)
+                return await dm.send("Voice design failed; try a different description.", suppress_embeds=True)
         await self.budget.record("fish", FISH_VOICE_DESIGN_USD)
-        await self._add_spend(ctx.guild.id, ctx.author.id, FISH_VOICE_DESIGN_USD)
+        await self._add_spend(guild_id, ctx.author.id, FISH_VOICE_DESIGN_USD)
         candidates = [c for c in candidates if c.get("audio")]
         if not candidates:
-            return await ctx.send("Fish didn't return any voices for that; try rewording it.", suppress_embeds=True)
+            return await dm.send("Fish didn't return any voices for that; try rewording it.", suppress_embeds=True)
 
         files = []
         for i, c in enumerate(candidates, 1):
             ext = {"wav": "wav", "ogg_opus": "ogg", "mp3": "mp3"}.get(audio_format(c["audio"]), "wav")
             files.append(discord.File(io.BytesIO(c["audio"]), filename=f"voice_{i}.{ext}"))
-        view = _DesignPickView(self, ctx, description, candidates)
-        view.message = await ctx.send(
-            f"Here are {len(candidates)} takes on **{description[:200]}**. Listen, then pick one to make it your voice:",
+        view = _DesignPickView(self, ctx.author.id, guild_id, ctx.clean_prefix, description, candidates)
+        view.message = await dm.send(
+            f"Here are {len(candidates)} takes on **{description[:200]}**. Listen, then pick one to save it. "
+            f"It won't change your voice until you choose it.",
             files=files, view=view, suppress_embeds=True,
         )
 
-    async def _save_designed_voice(self, ctx: commands.Context, description: str, candidate: dict) -> str:
+    async def _save_designed_voice(self, owner_id: int, origin_guild_id: Optional[int], description: str,
+                                   candidate: dict) -> str:
         """
-        Make a design candidate the user's voice; returns its voice ref.
+        Save a design candidate to the user's designed voices (usable in any server); returns its voice ref.
+        It isn't applied: the user picks it with `narrate voice` when they're ready.
 
         Prefers a private Fish model. Fish caps API model creation by prepaid credit, so when that's
         refused the sample is kept on disk instead and sent inline with each request (fish:ref:<key>).
@@ -1578,7 +1621,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 raise
             print(f"[narrate] fish model creation refused, keeping designed voice locally: {e}")
             key = uuid.uuid4().hex
-            sample_path = f"designed/{ctx.guild.id}/{key}.ogg"
+            sample_path = f"designed/user_{owner_id}/{key}.ogg"
             audio = candidate["audio"]
             if audio_format(audio) != "ogg_opus":
                 audio = await asyncio.to_thread(_transcode_to_ogg_opus, audio)
@@ -1593,16 +1636,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             VALUES ($1, $2, 'fish', $3, $4, $5, $6, $7)
             ON CONFLICT (provider, voice_id) DO NOTHING
             """,
-            ctx.guild.id, ctx.author.id, voice_id, title, description, sample_path, sample_text,
+            origin_guild_id, owner_id, voice_id, title, description, sample_path, sample_text,
         )
-        ref = f"fish:{voice_id}"
-        pref = await self._get_pref(ctx.guild.id, ctx.author.id)
-        channel_id = (pref.get("text_channel_id") if pref else None) or ctx.channel.id
-        rate       = float((pref.get("rate") if pref else None) or DEFAULT_RATE)
-        enabled    = bool(pref.get("enabled")) if pref else False
-        await self._upsert_pref(ctx, channel_id, ref, rate, enabled, voice_label=title)
-        await self._record_voice_history(ctx.guild.id, ctx.author.id, ref, title)
-        return ref
+        return f"fish:{voice_id}"
 
     async def _load_designed_sample(self, key: str) -> Optional[Tuple[bytes, str]]:
         """Router callback for fish:ref:<key> voices: (ogg sample, transcript), or None."""
@@ -1695,16 +1731,16 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             """
             SELECT voice_id, title, created_at
             FROM tts_designed_voices
-            WHERE guild_id=$1 AND user_id=$2
+            WHERE user_id=$1
             ORDER BY created_at DESC
             LIMIT 25
             """,
-            ctx.guild.id, ctx.author.id,
+            ctx.author.id,
         )
         if not rows:
             return await ctx.send(f"You haven't designed any voices yet. Try `{ctx.clean_prefix}narrate design <description>`.",
                                   suppress_embeds=True)
-        lines = [f"Your designed voices (use with `{ctx.clean_prefix}narrate voice fish:<id>`):"]
+        lines = [f"Your designed voices, usable in any server with `{ctx.clean_prefix}narrate voice <id>`:"]
         for r in rows:
             lines.append(f"- **{r['title']}**: `fish:{r['voice_id']}`")
         await ctx.send("\n".join(lines)[:1900], suppress_embeds=True)

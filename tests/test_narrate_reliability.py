@@ -3,9 +3,10 @@ import sys
 import time
 import types
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import discord
+import discord.ext.commands
 
 # Import the narration code without loading operator credentials from config/.env.
 config = types.ModuleType("config")
@@ -264,6 +265,86 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         msg = ch.send.await_args.args[0]
         self.assertIn("melon", msg)
         self.assertIn("!narrate voice gemini:kore@gemini-2.5-flash-preview-tts", msg)
+
+    def _design_ctx(self, in_guild=True, dm_forbidden=False):
+        ctx = Mock(clean_prefix="!")
+        ctx.author.id = 2
+        ctx.guild = self.guild if in_guild else None
+        ctx.send = AsyncMock()
+        typing_cm = MagicMock()
+        typing_cm.__aenter__ = AsyncMock()
+        typing_cm.__aexit__ = AsyncMock(return_value=False)
+        dm = Mock()
+        dm.send = AsyncMock(side_effect=discord.Forbidden(Mock(status=403), "no DMs") if dm_forbidden else None)
+        dm.typing = Mock(return_value=typing_cm)
+        ctx.author.create_dm = AsyncMock(return_value=dm)
+        if not in_guild:
+            ctx.channel = dm
+        return ctx, dm
+
+    def _design_setup(self):
+        self.cog.fish = Mock()
+        self.cog.fish.design = AsyncMock(return_value=[{"audio": b"RIFF" + b"\0" * 60, "id": "c1"}] * 3)
+        self.cog.budget.exhausted = AsyncMock(return_value=False)
+        self.cog.budget.record = AsyncMock()
+        self.cog._over_user_share = AsyncMock(return_value=False)
+        self.cog._add_spend = AsyncMock()
+
+    async def test_design_in_a_server_sends_samples_by_dm(self):
+        self._design_setup()
+        ctx, dm = self._design_ctx()
+        with patch.object(bot_narrate, "get_user_id", AsyncMock(return_value=2)),              patch.object(bot_narrate, "get_guild_id", AsyncMock(return_value=1)):
+            await self.cog.narrate_design.callback(self.cog, ctx, description="raspy old pirate")
+        self.assertIn("Check your DMs", ctx.send.await_args.args[0])
+        ctx.send.assert_awaited_once()                     # nothing about the voice in the channel
+        final = dm.send.await_args_list[-1]
+        self.assertEqual(len(final.kwargs["files"]), 3)
+        self.assertIsInstance(final.kwargs["view"], bot_narrate._DesignPickView)
+        self.cog._add_spend.assert_awaited_once_with(1, 2, bot_narrate.FISH_VOICE_DESIGN_USD)
+
+    async def test_design_with_dms_blocked_spends_nothing(self):
+        self._design_setup()
+        ctx, dm = self._design_ctx(dm_forbidden=True)
+        with patch.object(bot_narrate, "get_user_id", AsyncMock(return_value=2)),              patch.object(bot_narrate, "get_guild_id", AsyncMock(return_value=1)):
+            await self.cog.narrate_design.callback(self.cog, ctx, description="raspy old pirate")
+        self.cog.fish.design.assert_not_awaited()
+        self.assertIn("couldn't DM you", ctx.send.await_args.args[0])
+
+    async def test_design_directly_in_a_dm(self):
+        self._design_setup()
+        ctx, dm = self._design_ctx(in_guild=False)
+        get_guild = AsyncMock()
+        with patch.object(bot_narrate, "get_user_id", AsyncMock(return_value=2)),              patch.object(bot_narrate, "get_guild_id", get_guild):
+            await self.cog.narrate_design.callback(self.cog, ctx, description="raspy old pirate")
+        get_guild.assert_not_awaited()
+        ctx.send.assert_not_awaited()
+        self.assertIsInstance(dm.send.await_args.kwargs["view"], bot_narrate._DesignPickView)
+        self.cog._add_spend.assert_awaited_once_with(None, 2, bot_narrate.FISH_VOICE_DESIGN_USD)
+
+    async def test_saving_a_design_keeps_it_private_until_chosen(self):
+        self.cog.fish = Mock()
+        self.cog.fish.create_model = AsyncMock(return_value={"_id": "ABC123"})
+        db = Mock()
+        db.execute = AsyncMock()
+        self.bot.db_pool = db
+        self.cog._upsert_pref = AsyncMock()
+        ref = await self.cog._save_designed_voice(2, None, "raspy old pirate", {"audio": b"x", "id": "c1"})
+        self.assertEqual(ref, "fish:abc123")
+        args = db.execute.await_args.args
+        self.assertIn("INSERT INTO tts_designed_voices", args[0])
+        self.assertEqual(args[1:3], (None, 2))             # no server, owned by the user
+        self.cog._upsert_pref.assert_not_awaited()          # their voice isn't changed
+
+    async def test_server_only_commands_explain_themselves_in_dms(self):
+        ctx = Mock(guild=None, clean_prefix="!")
+        ctx.command.name = "on"
+        with self.assertRaises(discord.ext.commands.NoPrivateMessage):
+            await self.cog.cog_check(ctx)
+        ctx.command.name = "design"
+        self.assertTrue(await self.cog.cog_check(ctx))
+        ctx.send = AsyncMock()
+        await self.cog.cog_command_error(ctx, discord.ext.commands.NoPrivateMessage())
+        self.assertIn("narrate design", ctx.send.await_args.args[0])
 
     def test_bot_commands_are_not_narrated(self):
         bot = Mock(command_prefix="!")

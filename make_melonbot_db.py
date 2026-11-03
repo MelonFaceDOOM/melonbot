@@ -142,7 +142,7 @@ def make_db():
         ON narrate_voice_history (guild_id, user_id, set_at DESC)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS tts_designed_voices (
                 id          BIGSERIAL PRIMARY KEY,
-                guild_id    BIGINT NOT NULL,
+                guild_id    BIGINT,
                 user_id     BIGINT,
                 provider    VARCHAR(16) NOT NULL,
                 voice_id    VARCHAR(128) NOT NULL,
@@ -158,6 +158,7 @@ def make_db():
         ALTER TABLE tts_designed_voices
           ADD COLUMN IF NOT EXISTS sample_path TEXT,
           ADD COLUMN IF NOT EXISTS sample_text TEXT""")
+    cur.execute("""ALTER TABLE tts_designed_voices ALTER COLUMN guild_id DROP NOT NULL""")
     cur.execute("""CREATE INDEX IF NOT EXISTS tts_designed_voices_user_idx
                 ON tts_designed_voices (guild_id, user_id)""")
 

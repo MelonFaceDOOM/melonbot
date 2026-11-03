@@ -76,7 +76,7 @@ DDL = [
     """
     CREATE TABLE IF NOT EXISTS tts_designed_voices (
         id          BIGSERIAL PRIMARY KEY,
-        guild_id    BIGINT NOT NULL,
+        guild_id    BIGINT,
         user_id     BIGINT,
         provider    VARCHAR(16) NOT NULL,
         voice_id    VARCHAR(128) NOT NULL,
@@ -94,6 +94,10 @@ DDL = [
     ALTER TABLE tts_designed_voices
       ADD COLUMN IF NOT EXISTS sample_path TEXT,
       ADD COLUMN IF NOT EXISTS sample_text TEXT
+    """,
+    # Voices designed in a DM belong to the user, not a server
+    """
+    ALTER TABLE tts_designed_voices ALTER COLUMN guild_id DROP NOT NULL
     """,
     """
     CREATE INDEX IF NOT EXISTS tts_designed_voices_user_idx
