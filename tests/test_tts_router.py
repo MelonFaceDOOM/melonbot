@@ -52,7 +52,11 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_gemini_voice_sends_style_separately(self):
         res = await self.router.synth("gemini:kore", "ok [laugh]", style="dry")
         self.assertEqual((res.provider, res.fmt), ("gemini", "wav"))
-        self.gemini.synth.assert_awaited_once_with("ok <laugh>", "kore", "dry")
+        self.gemini.synth.assert_awaited_once_with("ok <laugh>", "kore", "dry", prefer=None)
+
+    async def test_gemini_voice_with_model_prefers_that_model(self):
+        await self.router.synth("gemini:kore@gemini-2.5-flash-preview-tts", "hello")
+        self.gemini.synth.assert_awaited_once_with("hello", "kore", None, prefer="gemini-2.5-flash-preview-tts")
 
     async def test_google_voice_strips_tags(self):
         res = await self.router.synth("en-US-Wavenet-D", "[whisper] hi [laugh]", style="sad")
@@ -201,6 +205,31 @@ class GeminiChainTests(unittest.IsolatedAsyncioTestCase):
         g = self.make()
         g._synth_one.side_effect = [ProviderError("gemini", 400, "No matching speaker voice"), WAV_1S]
         self.assertEqual(await g.synth("hi", "storyteller-2"), (WAV_1S, "m2"))
+
+    async def test_preferred_model_goes_first_then_chain(self):
+        g = self.make()
+        g._synth_one.side_effect = [RateLimited("gemini", 429, "Please retry in 3h"), WAV_1S]
+        self.assertEqual(await g.synth("hi", "kore", prefer="m3"), (WAV_1S, "m1"))
+        self.assertEqual([c.args[0] for c in g._synth_one.await_args_list], ["m3", "m1"])
+
+    async def test_preferred_model_outside_configured_chain(self):
+        g = self.make()
+        g._synth_one.return_value = WAV_1S
+        self.assertEqual(await g.synth("hi", "kore", prefer="m9"), (WAV_1S, "m9"))
+
+    def test_model_aliases(self):
+        r = tts_providers.resolve_gemini_model
+        self.assertEqual(r("2.5"), "gemini-2.5-flash-preview-tts")
+        self.assertEqual(r("2.5-Pro"), "gemini-2.5-pro-preview-tts")
+        self.assertEqual(r("gemini-3.8-flash-lite-tts"), "gemini-3.8-flash-lite-tts")
+        self.assertEqual(r("gemini-2.5"), "gemini-2.5-flash-preview-tts")
+        self.assertIsNone(r("4.0"))
+        self.assertEqual(tts_providers.split_gemini_voice("kore@gemini-3.1-flash-tts-preview"),
+                         ("kore", "gemini-3.1-flash-tts-preview"))
+        self.assertEqual(tts_providers.split_gemini_voice("kore"), ("kore", None))
+        for model in set(tts_providers.GEMINI_MODEL_ALIASES.values()):
+            self.assertIn(model, tts_providers.GEMINI_USD_PER_M_TOKENS)
+            self.assertIn(model, tts_providers.GEMINI_MODEL_LABELS)
 
     def test_retry_after_parsing(self):
         self.assertEqual(tts_providers.retry_after_secs("Please retry in 11h8m36s or upgrade"), 40116)

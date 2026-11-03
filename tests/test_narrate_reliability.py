@@ -215,6 +215,33 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(f.value) <= 1024 for f in embed.fields))  # Discord field limit
         self.assertLess(len(embed), 6000)                                  # Discord embed limit
 
+    async def test_gemini_voice_with_model(self):
+        self.cog.gemini = Mock()
+        self.cog.gemini.find_voice = AsyncMock(return_value={"id": "kore", "display_name": "Kore"})
+        self.cog._apply_voice = AsyncMock()
+        ctx = Mock()
+        ctx.send = AsyncMock()
+        await self.cog._set_gemini_voice(ctx, "Kore@2.5")
+        ref, label, _ = self.cog._apply_voice.await_args.args[1:]
+        self.assertEqual(ref, "gemini:kore@gemini-2.5-flash-preview-tts")
+        self.assertEqual(label, "Kore · Gemini 2.5 Flash")
+        self.cog.gemini.find_voice.assert_awaited_once_with("Kore")
+
+        await self.cog._set_gemini_voice(ctx, "Kore")
+        self.assertEqual(self.cog._apply_voice.await_args.args[1], "gemini:kore")
+
+        self.cog._apply_voice.reset_mock()
+        await self.cog._set_gemini_voice(ctx, "Kore@9.9")
+        self.cog._apply_voice.assert_not_awaited()
+        self.assertIn("2.5-pro", ctx.send.await_args.args[0])
+
+    async def test_voices_embed_explains_model_choice(self):
+        self.cog.fish, self.cog.gemini = Mock(), Mock()
+        embed = await self.cog._voices_embed(Mock(clean_prefix="!"))
+        gemini = next(f.value for f in embed.fields if f.name.startswith("✨"))
+        self.assertIn("gemini:Kore@2.5", gemini)
+        self.assertIn("`2.5-pro`", gemini)
+
     async def test_voices_embed_without_paid_providers(self):
         ctx = Mock(clean_prefix="!")
         embed = await self.cog._voices_embed(ctx)

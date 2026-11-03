@@ -64,6 +64,36 @@ DEFAULT_GEMINI_FALLBACK_MODELS = (
     "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
 )
 GEMINI_PCM_RATE = 24000  # older models return headerless 16-bit mono PCM at this rate
+# Short names users can put after a voice (gemini:kore@2.5) to try that model first
+GEMINI_MODEL_ALIASES = {
+    "3.8": "gemini-3.8-flash-tts", "3.8-flash": "gemini-3.8-flash-tts",
+    "3.8-lite": "gemini-3.8-flash-lite-tts", "3.8-flash-lite": "gemini-3.8-flash-lite-tts",
+    "3.1": "gemini-3.1-flash-tts-preview", "3.1-flash": "gemini-3.1-flash-tts-preview",
+    "2.5": "gemini-2.5-flash-preview-tts", "2.5-flash": "gemini-2.5-flash-preview-tts",
+    "2.5-pro": "gemini-2.5-pro-preview-tts",
+}
+GEMINI_MODEL_LABELS = {
+    "gemini-3.8-flash-tts": "Gemini 3.8 Flash",
+    "gemini-3.8-flash-lite-tts": "Gemini 3.8 Flash-Lite",
+    "gemini-3.1-flash-tts-preview": "Gemini 3.1 Flash",
+    "gemini-2.5-flash-preview-tts": "Gemini 2.5 Flash",
+    "gemini-2.5-pro-preview-tts": "Gemini 2.5 Pro",
+}
+
+
+def resolve_gemini_model(name: str) -> Optional[str]:
+    """'2.5' / '2.5-pro' / a full model id -> full model id, or None if unknown."""
+    key = (name or "").strip().lower().removeprefix("gemini-").removeprefix("gemini")
+    if key in GEMINI_MODEL_ALIASES:
+        return GEMINI_MODEL_ALIASES[key]
+    full = (name or "").strip().lower()
+    return full if full in GEMINI_USD_PER_M_TOKENS else None
+
+
+def split_gemini_voice(voice_id: str) -> Tuple[str, Optional[str]]:
+    """'kore@gemini-2.5-flash-preview-tts' -> ('kore', 'gemini-2.5-flash-preview-tts'); no '@' -> (id, None)."""
+    voice, _, model = (voice_id or "").partition("@")
+    return voice, (model or None)
 GEMINI_PRICE_CHANGE = date(2027, 1, 1)
 
 
@@ -413,6 +443,7 @@ class GeminiTTSProvider(_HttpProvider):
         self.api_key = api_key
         self.models: List[str] = [model] + [m for m in fallback_models if m and m != model]
         self.model = model  # primary
+        self._rpm = rpm
         self._limiters = {m: RpmLimiter(rpm) for m in self.models}
         self._blocked_until: Dict[str, float] = {}
         self._voices: Optional[Dict[str, dict]] = None
@@ -425,9 +456,12 @@ class GeminiTTSProvider(_HttpProvider):
         return max(0.0, self._blocked_until.get(model, 0.0) - time.monotonic())
 
     async def synth(self, text: str, voice: str, style: Optional[str] = None,
-                    max_wait: float = 5.0) -> Tuple[bytes, str]:
-        """Returns (wav bytes, model that produced them)."""
-        available = [m for m in self.models if self.blocked_for(m) <= 0]
+                    max_wait: float = 5.0, prefer: Optional[str] = None) -> Tuple[bytes, str]:
+        """Returns (wav bytes, model that produced them). `prefer` is tried before the usual chain."""
+        order = ([prefer] + [m for m in self.models if m != prefer]) if prefer else self.models
+        for m in order:
+            self._limiters.setdefault(m, RpmLimiter(self._rpm))
+        available = [m for m in order if self.blocked_for(m) <= 0]
         if not available:
             raise RateLimited("gemini", 429, "all Gemini models are at their limits")
         last_error: Optional[Exception] = None
@@ -740,7 +774,8 @@ class TTSRouter:
             cost = fish_cost(prepared, client.model)
             await self.budget.record("fish", cost, chars=len(prepared))
         else:
-            audio, model = await client.synth(prepared, voice_id, sep_style)
+            voice, prefer = split_gemini_voice(voice_id)
+            audio, model = await client.synth(prepared, voice, sep_style, prefer=prefer)
             secs = wav_duration(audio)
             if secs <= 0:
                 # Unparseable WAV: estimate (~12 chars/s of speech) so spend still counts toward the cap

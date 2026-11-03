@@ -19,7 +19,8 @@ from db_mixin import DbMixin
 from tts_providers import (
     BudgetTracker, FishTTSProvider, GeminiTTSProvider, GoogleTTSProvider, LRUCache, TTSRouter,
     DEFAULT_GOOGLE_VOICE, DEFAULT_LANG, DEFAULT_RATE, FISH_REF_PREFIX, FISH_VOICE_DESIGN_USD, ProviderError,
-    audio_format, extract_fish_id, parse_voice_ref,
+    GEMINI_MODEL_ALIASES, GEMINI_MODEL_LABELS, audio_format, extract_fish_id, parse_voice_ref,
+    resolve_gemini_model,
 )
 from tts_text import chunk_for_speech, split_leading_style
 import re
@@ -152,6 +153,15 @@ def _short_voice_name(voice_name: str) -> str:
     parts = voice_name.split("-", 2)
     return parts[2] if len(parts) >= 3 else voice_name
 
+def _gemini_model_choices() -> str:
+    """'`3.8` `3.8-lite` `3.1` `2.5` `2.5-pro`': one short name per model, in chain order."""
+    seen, names = set(), []
+    for alias, model in GEMINI_MODEL_ALIASES.items():
+        if model not in seen:
+            seen.add(model)
+            names.append(f"`{alias}`")
+    return " ".join(names)
+
 def _usd_bar(spent: float, cap: float, width: int = 12) -> str:
     """Text progress bar like '███░░░░░░░░░ 24%'."""
     frac = 0.0 if cap <= 0 else min(1.0, max(0.0, spent / cap))
@@ -163,6 +173,8 @@ def _voice_display(voice_ref: str, label: Optional[str]) -> str:
     provider, _ = parse_voice_ref(voice_ref)
     if provider == "google":
         return f"{voice_ref} ({label})" if label else voice_ref
+    if label and "Gemini" in label:  # 'Kore · Gemini 2.5 Flash' already says it
+        return label
     return f"{label or voice_ref} ({'Fish' if provider == 'fish' else 'Gemini'})"
 
 
@@ -1174,7 +1186,10 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 name="✨ Gemini",
                 value=(f"🎯 **Best at following `[style]` hints** · 🐢 slower (~3–5 s) · 200+ voices\n"
                        f"[Voice list]({GEMINI_VOICES_URL})\n"
-                       f"`{p} voice gemini:Kore`"),
+                       f"`{p} voice gemini:Kore`\n"
+                       f"Prefer an older model's sound? Add it after `@`: `{p} voice gemini:Kore@2.5`\n"
+                       f"Models: {_gemini_model_choices()} (default `3.8`). "
+                       f"If yours is out of quota, the others fill in."),
                 inline=False,
             )
         embed.add_field(
@@ -1362,7 +1377,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             # A bare Gemini voice name (Google names/nicknames win when both exist)
             if self.gemini:
                 try:
-                    if await self.gemini.find_voice(q):
+                    if await self.gemini.find_voice(q.partition("@")[0]):
                         return await self._set_gemini_voice(ctx, q)
                 except Exception as e:
                     print(f"[narrate] gemini voice lookup failed: {e}")
@@ -1398,18 +1413,36 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         await ctx.send(f"Voice set to **{label}** ({provider_name}).", suppress_embeds=True)
 
     async def _set_gemini_voice(self, ctx: commands.Context, name: str):
+        """`name` is a voice, optionally with a preferred model: 'Kore' or 'Kore@2.5'."""
         if not self.gemini:
             return await ctx.send("Gemini TTS isn't set up on this bot.", suppress_embeds=True)
+        voice_name, _, model_name = name.partition("@")
+        voice_name = voice_name.strip()
+        model = None
+        if model_name.strip():
+            model = resolve_gemini_model(model_name)
+            if not model:
+                return await ctx.send(
+                    f"Unknown Gemini model `{model_name.strip()}`. Use one of: {_gemini_model_choices()}.",
+                    suppress_embeds=True)
         try:
-            v = await self.gemini.find_voice(name)
+            v = await self.gemini.find_voice(voice_name)
         except Exception as e:
             print(f"[narrate] gemini voice lookup failed: {e}")
             return await ctx.send("Couldn't reach Gemini to check that voice; try again shortly.", suppress_embeds=True)
         if not v:
-            return await ctx.send(f"Gemini has no voice called `{name}`. See <{GEMINI_VOICES_URL}>.", suppress_embeds=True)
+            return await ctx.send(f"Gemini has no voice called `{voice_name}`. See <{GEMINI_VOICES_URL}>.",
+                                  suppress_embeds=True)
         label = v.get("display_name") or v["id"]
         desc = f": {v['description']}" if v.get("description") else ""
-        await self._apply_voice(ctx, f"gemini:{v['id'].lower()}", label[:256], f"Gemini{desc}"[:300])
+        ref = f"gemini:{v['id'].lower()}"
+        provider_name = f"Gemini{desc}"
+        if model:
+            ref += f"@{model}"
+            label += f" · {GEMINI_MODEL_LABELS.get(model, model)}"
+            provider_name = (f"{GEMINI_MODEL_LABELS.get(model, model)} first, other Gemini models if it's out of quota"
+                             f"{desc}")
+        await self._apply_voice(ctx, ref, label[:256], provider_name[:300])
 
     @narrate_root.command(name="style")
     async def narrate_style(self, ctx: commands.Context, *, style: str):
