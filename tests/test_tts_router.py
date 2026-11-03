@@ -85,6 +85,13 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.google.synth.assert_not_awaited()
         self.assertGreater(res.cost_usd, 0)
 
+    async def test_gemini_error_also_uses_fish_standin(self):
+        self.gemini.synth.side_effect = ProviderError("gemini", 400, "bad request")
+        router = TTSRouter(self.google, self.fish, self.gemini, self.budget, fish_standin_voice=FISH_ID)
+        res = await router.synth("gemini:kore", "hello")
+        self.assertEqual((res.provider, res.fallback_reason), ("fish", "error"))
+        self.google.synth.assert_not_awaited()
+
     async def test_fish_rate_limit_falls_back_to_google(self):
         self.fish.synth.side_effect = RateLimited("fish", 429, "slow down")
         res = await self.router.synth(f"fish:{FISH_ID}", "hello")
@@ -230,6 +237,52 @@ class GeminiChainTests(unittest.IsolatedAsyncioTestCase):
         for model in set(tts_providers.GEMINI_MODEL_ALIASES.values()):
             self.assertIn(model, tts_providers.GEMINI_USD_PER_M_TOKENS)
             self.assertIn(model, tts_providers.GEMINI_MODEL_LABELS)
+
+    def test_style_goes_where_each_model_accepts_it(self):
+        new = tts_providers.GeminiTTSProvider.build_body("gemini-3.8-flash-tts", "hi", "kore", "cheerful")
+        content = new["input"][0]["content"][0]
+        self.assertEqual(content["text"], "hi")
+        self.assertEqual(content["annotations"], [{"type": "speech_metadata", "style": "cheerful"}])
+        for old in ("gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts"):
+            content = tts_providers.GeminiTTSProvider.build_body(old, "hi", "kore", "cheerful")["input"][0]["content"][0]
+            self.assertNotIn("annotations", content)
+            self.assertEqual(content["text"], "Read aloud in this style (cheerful): hi")
+        plain = tts_providers.GeminiTTSProvider.build_body("gemini-2.5-flash-preview-tts", "hi", "kore", None)
+        self.assertEqual(plain["input"][0]["content"][0], {"type": "text", "text": "hi"})
+
+    async def test_rejected_style_is_dropped_on_the_same_model(self):
+        g = self.make()
+        g._synth_one.side_effect = [
+            ProviderError("gemini", 400, '{"error":{"message":"Speech annotations are not supported for model m1."}}'),
+            WAV_1S, WAV_1S]
+        self.assertEqual(await g.synth("hi", "kore", "cheerful"), (WAV_1S, "m1"))
+        calls = [(c.args[0], c.args[3]) for c in g._synth_one.await_args_list]
+        self.assertEqual(calls, [("m1", "cheerful"), ("m1", None)])
+        # Remembered: next time m1 gets no style straight away, no wasted request
+        await g.synth("hi", "kore", "cheerful")
+        self.assertEqual(g._synth_one.await_args_list[-1].args[3], None)
+        self.assertEqual(g._synth_one.await_count, 3)
+
+    def test_style_rejection_matcher(self):
+        m = tts_providers._STYLE_REJECTED_RE.search
+        self.assertTrue(m("Speech metadata is not supported for this model."))
+        self.assertTrue(m("Speech annotations are not supported for model 'gemini-2.5-flash-preview-tts'."))
+        self.assertFalse(m("No matching speaker voice found for name: zzz"))
+
+    async def test_quota_plus_other_error_is_reported_as_quota(self):
+        g = self.make()
+        g._synth_one.side_effect = [RateLimited("gemini", 429, "Please retry in 1h"),
+                                    RateLimited("gemini", 429, "Please retry in 1h"),
+                                    ProviderError("gemini", 400, "No matching speaker voice found")]
+        with self.assertRaises(RateLimited):
+            await g.synth("hi", "kore", "cheerful")
+
+    async def test_non_quota_errors_alone_stay_errors(self):
+        g = self.make()
+        g._synth_one.side_effect = ProviderError("gemini", 400, "bad request")
+        with self.assertRaises(ProviderError) as cm:
+            await g.synth("hi", "kore")
+        self.assertNotIsInstance(cm.exception, RateLimited)
 
     def test_retry_after_parsing(self):
         self.assertEqual(tts_providers.retry_after_secs("Please retry in 11h8m36s or upgrade"), 40116)

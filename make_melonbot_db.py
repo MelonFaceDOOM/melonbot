@@ -128,6 +128,18 @@ def make_db():
                 guild_id BIGINT NOT NULL,
                 est_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
                 PRIMARY KEY (month, guild_id))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS narrate_voice_history (
+        id          BIGSERIAL PRIMARY KEY,
+        guild_id    BIGINT NOT NULL,
+        user_id     BIGINT NOT NULL,
+        voice       VARCHAR(160) NOT NULL,
+        voice_label VARCHAR(256),
+        set_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id)  REFERENCES users  (id) ON DELETE CASCADE
+    )""")
+    cur.execute("""CREATE INDEX IF NOT EXISTS narrate_voice_history_user_idx
+        ON narrate_voice_history (guild_id, user_id, set_at DESC)""")
     cur.execute("""CREATE TABLE IF NOT EXISTS tts_designed_voices (
                 id          BIGSERIAL PRIMARY KEY,
                 guild_id    BIGINT NOT NULL,

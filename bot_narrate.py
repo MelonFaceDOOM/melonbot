@@ -13,7 +13,7 @@ from config import (
     google_narrate_key, fish_api_key, gemini_api_key, FISH_DEFAULT_VOICE_ID, FISH_MODEL,
     GEMINI_MODEL, GEMINI_FALLBACK_MODELS, GEMINI_RPM, TTS_MONTHLY_BUDGET_USD,
 )
-from bot_helpers import get_user_id, get_guild_id
+from bot_helpers import get_user_id, get_guild_id, paginate, parse_user_input_for_mention, send_goodly
 from db_mixin import DbMixin
 # LRUCache / GoogleTTSProvider / DEFAULT_LANG lived here before tts_providers; still importable from bot_narrate.
 from tts_providers import (
@@ -99,8 +99,9 @@ def _clean_content(s: str) -> str:
     kept = [t for t in toks if not _is_noise_token(t)]
     return " ".join(kept).strip()
 
-def _message_is_narrate_command(bot: commands.Bot, content: str) -> bool:
-    """Return True if the message looks like a narrate command with the bot's prefix."""
+def _message_is_bot_command(bot: commands.Bot, content: str) -> bool:
+    """True if the message invokes one of this bot's commands (!narrate, !add, ...); those aren't narrated.
+    '!wow' or '! lol' aren't commands, so they're still read out."""
     if not content:
         return False
     content = content.strip()
@@ -111,9 +112,10 @@ def _message_is_narrate_command(bot: commands.Bot, content: str) -> bool:
     if isinstance(prefixes, str):
         prefixes = [prefixes]
     for p in prefixes:
-        if content.startswith(p):
-            rest = content[len(p):].lstrip().lower()
-            return rest.startswith("narrate")
+        if p and content.startswith(p):
+            words = content[len(p):].split(maxsplit=1)
+            # all_commands is case-insensitive here (bot is built with case_insensitive=True)
+            return bool(words) and bot.get_command(words[0]) is not None
     return False
 
 def _now_ms() -> int:
@@ -638,7 +640,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         return usd
 
     async def _add_spend(self, guild_id: int, user_id: int, usd: float) -> None:
-        """Charge paid-voice spend to the user (for their share cap) and the server (for !quota)."""
+        """Charge paid-voice spend to the user (for their share cap) and the server (for !narrate quota)."""
         if usd <= 0:
             return
         month = BudgetTracker.current_month()
@@ -1115,9 +1117,10 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "  !narrate style <delivery|off>       (default style, e.g. 'dry and sarcastic')\n"
             "  !narrate design <description>       (create a brand-new voice)\n"
             "  !narrate designs                    (your designed voices)\n"
+            "  !narrate recent [n,p] [@someone]    (voices someone has used, newest first)\n"
             "  !narrate rate <float>\n"
             "  !narrate usage                      (this month's TTS spend)\n"
-            "  !quota                              (your + this server's premium-voice spend)\n"
+            "  !narrate quota                      (your + this server's premium-voice spend)\n"
             "  !narrate save <voiceline-name>      (saves your most recently narrated audio)\n"
             "  !narrate list                       (lists saved voicelines for this server)\n"
             "  !narrate rename <old> <new>\n"
@@ -1128,7 +1131,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             "and use [laugh] [sigh] [gasp] [pause] anywhere (Fish & Gemini voices only)."
         )
         # Show the prefix this bot actually uses (dev runs with '?')
-        usage = usage.replace("!narrate", f"{ctx.clean_prefix}narrate").replace("!quota", f"{ctx.clean_prefix}quota")
+        usage = usage.replace("!narrate", f"{ctx.clean_prefix}narrate")
         await ctx.send(usage, suppress_embeds=True)
 
     @narrate_root.command(name="on", aliases=["start"])
@@ -1397,6 +1400,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
         # Persist the full name in prefs (what TTS needs)
         await self._upsert_pref(ctx, channel_id, voice_name, rate, enabled, voice_label=nickname or None)
+        await self._record_voice_history(ctx.guild.id, ctx.author.id, voice_name, nickname or None)
 
         # Friendly confirmation shows both full name and nickname
         await ctx.send(
@@ -1410,6 +1414,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         rate       = float((pref.get("rate") if pref else None) or DEFAULT_RATE)
         enabled    = bool(pref.get("enabled")) if pref else False
         await self._upsert_pref(ctx, channel_id, ref, rate, enabled, voice_label=label)
+        await self._record_voice_history(ctx.guild.id, ctx.author.id, ref, label)
         await ctx.send(f"Voice set to **{label}** ({provider_name}).", suppress_embeds=True)
 
     async def _set_gemini_voice(self, ctx: commands.Context, name: str):
@@ -1461,8 +1466,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         await ctx.send(f"Default style set to **{style[:200]}**{note}. Starting a message with `[...]` overrides it.",
                        suppress_embeds=True)
 
-    @commands.command(name="quota")
-    async def quota(self, ctx: commands.Context):
+    @narrate_root.command(name="quota")
+    async def narrate_quota(self, ctx: commands.Context):
         """Your and this server's premium-voice (Fish/Gemini) spend this month."""
         if not ctx.guild:
             return await ctx.send("Run this in a server.")
@@ -1595,6 +1600,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         rate       = float((pref.get("rate") if pref else None) or DEFAULT_RATE)
         enabled    = bool(pref.get("enabled")) if pref else False
         await self._upsert_pref(ctx, channel_id, ref, rate, enabled, voice_label=title)
+        await self._record_voice_history(ctx.guild.id, ctx.author.id, ref, title)
         return ref
 
     async def _load_designed_sample(self, key: str) -> Optional[Tuple[bytes, str]]:
@@ -1616,6 +1622,71 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             print(f"[narrate] designed voice sample missing at {p}: {e}")
             return None
         return audio, row["sample_text"] or DESIGN_PREVIEW_LINE
+
+    async def _record_voice_history(self, guild_id: int, user_id: int, voice: str, label: Optional[str]) -> None:
+        """Append a voice pick to the user's history (skipped if it's the same as their last one)."""
+        try:
+            last = await self.db.fetchrow(
+                """
+                SELECT voice FROM narrate_voice_history
+                WHERE guild_id=$1 AND user_id=$2
+                ORDER BY set_at DESC, id DESC LIMIT 1
+                """,
+                guild_id, user_id,
+            )
+            if last and last["voice"] == voice:
+                return
+            await self.db.execute(
+                """
+                INSERT INTO narrate_voice_history (guild_id, user_id, voice, voice_label)
+                VALUES ($1, $2, $3, $4)
+                """,
+                guild_id, user_id, voice[:160], (label or None) and label[:256],
+            )
+        except Exception as e:
+            print(f"[narrate] failed to record voice history: {e}")
+
+    @narrate_root.command(name="recent")
+    async def narrate_recent(self, ctx: commands.Context, *user_input):
+        """<name or mention> <[n,p]> — Voices someone has used, newest first (default: you, 15 per page)."""
+        guild_id = await get_guild_id(ctx, self.db)
+        if guild_id is None:
+            return
+        try:
+            pagination, discord_id, username = await parse_user_input_for_mention(self.db, ctx, user_input)
+        except Exception as e:
+            print(f"Parsing User Input error: {e}")
+            return await ctx.send("Ruh roh user input error")
+        if not discord_id:
+            if user_input and any(not a.startswith("[") for a in user_input):
+                return await ctx.send("Couldn't find that person in this server.", suppress_embeds=True)
+            discord_id, username = ctx.author.id, ctx.author.name
+        if not pagination:
+            pagination = (15, 1)
+        title_descriptor = "RECENT" if pagination[0] > 0 else "OLDEST"
+        try:
+            rows = await self.db.fetch(
+                """
+                SELECT voice, voice_label, set_at FROM narrate_voice_history
+                WHERE guild_id=$1 AND user_id=$2
+                ORDER BY set_at DESC, id DESC
+                """,
+                guild_id, discord_id,
+            )
+        except asyncpg.exceptions.PostgresError as e:
+            print(f"Database error: {e}")
+            return await ctx.send("Ruh roh database error")
+        if not rows:
+            return await ctx.send(f"No voice history for {username} yet.", suppress_embeds=True)
+        current = (await self._get_pref(guild_id, discord_id) or {}).get("voice")
+        rows = await paginate(list(rows), pagination[0], pagination[1])
+        message = f"------ {title_descriptor} VOICES FROM {username.upper()} ------\n"
+        for r in rows:
+            mark = " *" if r["voice"] == current else ""
+            message += f"{r['set_at']:%Y-%m-%d} - {_voice_display(r['voice'], r['voice_label'])}{mark}\n"
+            message += f"             {ctx.clean_prefix}narrate voice {r['voice']}\n"
+        message += "* = current voice"
+        return await send_goodly(ctx, message)
 
     @narrate_root.command(name="designs")
     async def narrate_designs(self, ctx: commands.Context):
@@ -1750,7 +1821,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         """Narrate message into voice chat if appropriate. Bot commands are ignored here."""
         if message.author.bot or not message.guild:
             return
-        if _message_is_narrate_command(self.bot, message.content):
+        if _message_is_bot_command(self.bot, message.content):
             return
         if _is_link_emoji_or_mention_only(message.content or ""):
             return

@@ -3,7 +3,8 @@ Multi-provider narration (Fish / Gemini / Google):
 - narrate_prefs.voice_label, narrate_prefs.style
 - tts_usage: month-to-date estimated spend per paid provider (budget cap)
 - tts_user_usage: month-to-date estimated spend per user (one user may use at most half the budget)
-- tts_guild_usage: month-to-date estimated spend per server (shown by !quota)
+- tts_guild_usage: month-to-date estimated spend per server (shown by !narrate quota)
+- narrate_voice_history: every voice a user picks (shown by !narrate recent), seeded with current voices
 - tts_designed_voices: voices users created with `!narrate design`
 """
 
@@ -47,6 +48,30 @@ DDL = [
         est_usd  NUMERIC(12,6) NOT NULL DEFAULT 0,
         PRIMARY KEY (month, guild_id)
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS narrate_voice_history (
+        id          BIGSERIAL PRIMARY KEY,
+        guild_id    BIGINT NOT NULL,
+        user_id     BIGINT NOT NULL,
+        voice       VARCHAR(160) NOT NULL,
+        voice_label VARCHAR(256),
+        set_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (guild_id) REFERENCES guilds (id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id)  REFERENCES users  (id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS narrate_voice_history_user_idx
+        ON narrate_voice_history (guild_id, user_id, set_at DESC)
+    """,
+    """
+    INSERT INTO narrate_voice_history (guild_id, user_id, voice, voice_label, set_at)
+    SELECT p.guild_id, p.user_id, p.voice, p.voice_label, p.updated_at
+    FROM narrate_prefs p
+    WHERE p.voice IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM narrate_voice_history h
+                      WHERE h.guild_id = p.guild_id AND h.user_id = p.user_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS tts_designed_voices (

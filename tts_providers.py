@@ -64,6 +64,13 @@ DEFAULT_GEMINI_FALLBACK_MODELS = (
     "gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts",
 )
 GEMINI_PCM_RATE = 24000  # older models return headerless 16-bit mono PCM at this rate
+# Only these accept the speech_metadata style annotation; older models reject it ("Speech annotations are
+# not supported") and instead take the style as a spoken direction in front of the text, which they don't read aloud.
+GEMINI_ANNOTATION_MODELS = frozenset({"gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts"})
+# A 400 that means "this model can't take a style" (vs. a bad voice etc.): retry the same model without it
+_STYLE_REJECTED_RE = re.compile(
+    r"(annotation|metadata|style|prompt)\w*\W+(?:\w+\W+){0,4}not supported|not supported\W+(?:\w+\W+){0,4}"
+    r"(annotation|metadata|style|prompt)", re.I)
 # Short names users can put after a voice (gemini:kore@2.5) to try that model first
 GEMINI_MODEL_ALIASES = {
     "3.8": "gemini-3.8-flash-tts", "3.8-flash": "gemini-3.8-flash-tts",
@@ -446,6 +453,8 @@ class GeminiTTSProvider(_HttpProvider):
         self._rpm = rpm
         self._limiters = {m: RpmLimiter(rpm) for m in self.models}
         self._blocked_until: Dict[str, float] = {}
+        # Models that rejected a style: they get the text without one from then on
+        self._no_style_models: set = set()
         self._voices: Optional[Dict[str, dict]] = None
         self._voices_lock = asyncio.Lock()
 
@@ -464,36 +473,58 @@ class GeminiTTSProvider(_HttpProvider):
         available = [m for m in order if self.blocked_for(m) <= 0]
         if not available:
             raise RateLimited("gemini", 429, "all Gemini models are at their limits")
+        # If any model was skipped or refused for quota, the chain ran out of capacity: report that as a
+        # rate limit even when the last model failed for another reason, so callers treat it as one.
+        limited = len(available) < len(order)
         last_error: Optional[Exception] = None
         for i, model in enumerate(available):
             # Don't queue behind one model's per-minute limit while another model has room;
             # only the last option is worth waiting a few seconds for.
             if not await self._limiters[model].acquire(max_wait if i == len(available) - 1 else 0):
+                limited = True
                 last_error = RateLimited("gemini", None, f"{model}: client-side rate limit")
                 continue
-            try:
-                return await self._synth_one(model, text, voice, style), model
-            except RateLimited as e:
-                wait = retry_after_secs(str(e)) or 60.0
-                self._blocked_until[model] = time.monotonic() + wait
-                print(f"[tts] gemini {model} limited for {wait / 3600:.1f}h; trying next model")
-                last_error = e
-            except ProviderError as e:
-                # e.g. a voice an older model doesn't have; another model may still work
-                print(f"[tts] gemini {model} failed ({e.status}); trying next model")
-                last_error = e
+            # A style the model can't take is dropped (same model, same voice) rather than switching models
+            styles = [style, None] if style and model not in self._no_style_models else [None]
+            for attempt_style in styles:
+                try:
+                    return await self._synth_one(model, text, voice, attempt_style), model
+                except RateLimited as e:
+                    wait = retry_after_secs(str(e)) or 60.0
+                    self._blocked_until[model] = time.monotonic() + wait
+                    print(f"[tts] gemini {model} limited for {wait / 3600:.1f}h; trying next model")
+                    limited = True
+                    last_error = e
+                    break
+                except ProviderError as e:
+                    last_error = e
+                    if attempt_style and e.status == 400 and _STYLE_REJECTED_RE.search(str(e)):
+                        print(f"[tts] gemini {model} rejected the style; retrying without it")
+                        self._no_style_models.add(model)
+                        continue
+                    # e.g. a voice an older model doesn't have; another model may still work
+                    print(f"[tts] gemini {model} failed ({e.status}): {str(e)[:200]}; trying next model")
+                    break
+        if limited and not isinstance(last_error, RateLimited):
+            raise RateLimited("gemini", 429, f"Gemini models out of quota (last error: {last_error})")
         raise last_error or RateLimited("gemini", 429, "no Gemini model available")
 
-    async def _synth_one(self, model: str, text: str, voice: str, style: Optional[str]) -> bytes:
+    @staticmethod
+    def build_body(model: str, text: str, voice: str, style: Optional[str]) -> dict:
+        if style and model not in GEMINI_ANNOTATION_MODELS:
+            text = f"Read aloud in this style ({style}): {text}"
         content = {"type": "text", "text": text}
-        if style:
+        if style and model in GEMINI_ANNOTATION_MODELS:
             content["annotations"] = [{"type": "speech_metadata", "style": style}]
-        body = {
+        return {
             "model": model,
             "input": [{"type": "user_input", "content": [content]}],
             "response_format": {"type": "audio"},
             "generation_config": {"speech_config": [{"voice": voice}]},
         }
+
+    async def _synth_one(self, model: str, text: str, voice: str, style: Optional[str]) -> bytes:
+        body = self.build_body(model, text, voice, style)
         session = await self._sess()
         async with session.post(GEMINI_INTERACTIONS_ENDPOINT, json=body, headers=self._auth()) as resp:
             raw = await resp.read()
@@ -737,16 +768,17 @@ class TTSRouter:
                 except RateLimited as e:
                     print(f"[tts] {provider} rate limited: {e}")
                     reason = "gemini_limit" if provider == "gemini" else "rate_limited"
-                    if provider == "gemini" and self.fish and self.fish_standin_voice:
-                        try:
-                            res = await self._synth_paid("fish", self.fish, self.fish_standin_voice, text, style, rate)
-                            res.fallback_reason = reason
-                            return res
-                        except Exception as e2:
-                            print(f"[tts] fish stand-in for gemini failed: {e2}")
                 except Exception as e:
                     print(f"[tts] {provider} synth failed: {e}")
                     reason = "balance" if getattr(e, "status", None) == 402 else "error"
+                # A Fish voice is a much closer stand-in for Gemini than Google is
+                if provider == "gemini" and self.fish and self.fish_standin_voice:
+                    try:
+                        res = await self._synth_paid("fish", self.fish, self.fish_standin_voice, text, style, rate)
+                        res.fallback_reason = reason
+                        return res
+                    except Exception as e2:
+                        print(f"[tts] fish stand-in for gemini failed: {e2}")
             voice_id = DEFAULT_GOOGLE_VOICE
 
         prepared, _ = tts_text.prepare(text, "google")

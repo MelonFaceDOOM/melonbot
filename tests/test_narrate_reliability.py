@@ -134,6 +134,73 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(False, results)
         self.cog._guild_workers[1].cancel()
 
+    async def test_voice_history_skips_repeat_of_last_voice(self):
+        db = Mock()
+        db.fetchrow = AsyncMock(return_value={"voice": "gemini:kore"})
+        db.execute = AsyncMock()
+        self.bot.db_pool = db
+        await self.cog._record_voice_history(1, 2, "gemini:kore", "Kore")
+        db.execute.assert_not_awaited()
+        await self.cog._record_voice_history(1, 2, "gemini:puck", "Puck")
+        self.assertEqual(db.execute.await_args.args[1:], (1, 2, "gemini:puck", "Puck"))
+
+    async def _run_recent(self, parsed, *user_input, history=None):
+        from datetime import datetime
+        history = history if history is not None else [
+            {"voice": f"gemini:v{i}", "voice_label": f"Voice {i}", "set_at": datetime(2026, 11, 3 - i % 3)}
+            for i in range(20)]
+        db = Mock()
+        db.fetch = AsyncMock(return_value=history)
+        self.bot.db_pool = db
+        self.cog._get_pref.return_value = {"voice": "gemini:v0"}
+        sent = []
+        ctx = Mock(clean_prefix="!")
+        ctx.author.id, ctx.author.name = 2, "melon"
+        ctx.send = AsyncMock()
+        with patch.object(bot_narrate, "get_guild_id", AsyncMock(return_value=1)), \
+             patch.object(bot_narrate, "parse_user_input_for_mention", AsyncMock(return_value=parsed)), \
+             patch.object(bot_narrate, "send_goodly", AsyncMock(side_effect=lambda c, m: sent.append(m))):
+            await self.cog.narrate_recent.callback(self.cog, ctx, *user_input)
+        return db, ctx, sent
+
+    async def test_recent_defaults_to_you_and_15(self):
+        db, ctx, sent = await self._run_recent((None, None, None))
+        self.assertEqual(db.fetch.await_args.args[1:], (1, 2))
+        body = sent[0]
+        self.assertIn("RECENT VOICES FROM MELON", body)
+        self.assertEqual(body.count("!narrate voice gemini:"), 15)
+        self.assertIn("Voice 0 (Gemini) *", body)       # current voice is marked
+        self.assertNotIn("Voice 1 (Gemini) *", body)
+
+    async def test_recent_for_a_mentioned_user_with_page_size(self):
+        db, ctx, sent = await self._run_recent(((3, 2), 77, "roko"), "[3,2]", "<@77>")
+        self.assertEqual(db.fetch.await_args.args[1:], (1, 77))
+        self.assertIn("VOICES FROM ROKO", sent[0])
+        self.assertEqual(sent[0].count("!narrate voice gemini:"), 3)
+        self.assertIn("gemini:v3", sent[0])              # page 2 of 3 = entries 3..5
+
+    async def test_recent_unknown_name(self):
+        db, ctx, sent = await self._run_recent((None, None, None), "nobodyhere")
+        db.fetch.assert_not_awaited()
+        self.assertIn("Couldn't find", ctx.send.await_args.args[0])
+
+    async def test_recent_empty_history(self):
+        db, ctx, sent = await self._run_recent((None, None, None), history=[])
+        self.assertIn("No voice history", ctx.send.await_args.args[0])
+
+    def test_bot_commands_are_not_narrated(self):
+        bot = Mock(command_prefix="!")
+        bot.get_command = lambda name: Mock() if name.lower() in {"quota", "narrate", "rate"} else None
+        is_cmd = bot_narrate._message_is_bot_command
+        self.assertTrue(is_cmd(bot, "!quota"))
+        self.assertTrue(is_cmd(bot, "!Quota"))
+        self.assertTrue(is_cmd(bot, "!narrate voice gemini:Kore"))
+        self.assertTrue(is_cmd(bot, "  !rate 5"))
+        self.assertFalse(is_cmd(bot, "!wow that's crazy"))
+        self.assertFalse(is_cmd(bot, "! lol"))
+        self.assertFalse(is_cmd(bot, "quota please"))
+        self.assertFalse(is_cmd(bot, "!"))
+
     def test_rate_bucket_only_trips_on_floods(self):
         # A normal burst of chat, even with a pasted max-length message, is fine
         for _ in range(4):
@@ -183,7 +250,7 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         self.cog.budget.spent = AsyncMock(return_value=4.0)
         ctx = Mock()
         ctx.send = AsyncMock()
-        await self.cog.quota.callback(self.cog, ctx)
+        await self.cog.narrate_quota.callback(self.cog, ctx)
         embed = ctx.send.await_args.kwargs["embed"]
         values = {f.name: f.value for f in embed.fields}
         self.assertIn("$1.25 of your $5.00 limit", values["You"])
@@ -197,7 +264,7 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         self.cog.budget.spent = AsyncMock(return_value=float("inf"))
         ctx = Mock()
         ctx.send = AsyncMock()
-        await self.cog.quota.callback(self.cog, ctx)
+        await self.cog.narrate_quota.callback(self.cog, ctx)
         values = {f.name: f.value for f in ctx.send.await_args.kwargs["embed"].fields}
         self.assertIn("unavailable", values["This server"])
         self.assertIn("unavailable", values["Shared budget (all servers)"])
