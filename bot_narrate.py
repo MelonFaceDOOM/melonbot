@@ -43,6 +43,7 @@ USER_BUDGET_SHARE = 0.5                    # one user may spend at most this sha
 SELF_DISCONNECT_GRACE_SECS = 15            # voice-state events this soon after our own disconnect aren't kicks
 ALONE_DISCONNECT_SECS = 10                 # safety net (checked every 5s): leave if no humans have been in the bot's channel this long
 RATE_MIN, RATE_MAX = 0.25, 4.0
+VOLUME_MIN, VOLUME_MAX = 10, 200           # per-user playback volume, percent (100 = as generated)
 PLAYBACK_IDLE_DISCONNECT_SECS = 3600       # leave VC when idle
 # Voice ref for users who haven't picked one; existing Google picks are left alone.
 DEFAULT_VOICE = f"fish:{FISH_DEFAULT_VOICE_ID.lower()}" if (FISH_DEFAULT_VOICE_ID and fish_api_key) else DEFAULT_GOOGLE_VOICE
@@ -197,9 +198,10 @@ HELP_SECTIONS = [
         ("voice <link | ID | gemini:Name | google name>", "pick your voice. Add `@2.5` etc. to a Gemini voice to prefer a model"),
         ("recent [n,p] [@someone]", "voices someone has used, newest first, with commands to switch back"),
         ("rate <0.25–4>", "speaking speed (1 is normal)"),
+        ("volume <10–200>", "how loud your messages play, in % (100 is normal; also `vol`)"),
     ]),
     ("🎭 Delivery (Fish & Gemini voices)", [
-        ("style <text | off>", "default delivery for your messages, e.g. `dry and sarcastic`"),
+        ("style [text]", "default delivery for your messages, e.g. `dry and sarcastic`. No text clears it"),
     ]),
     ("🎨 Make your own", [
         ("design <description>", "invent a voice. I DM you 4 takes to pick from (or refine), privately"),
@@ -399,9 +401,9 @@ class GuildVoiceSession():
         return time.monotonic() - self.self_disconnect_at < SELF_DISCONNECT_GRACE_SECS
 
     # ---------- enqueue ----------
-    async def enqueue(self, audio_bytes: bytes):
+    async def enqueue(self, audio_bytes: bytes, volume: float = 1.0):
         try:
-            self.queue.put_nowait(audio_bytes)
+            self.queue.put_nowait((audio_bytes, volume))
         except asyncio.QueueFull:
             print(f"[narrate] playback queue full, dropping clip: guild={self.guild_id}")
             return
@@ -459,10 +461,11 @@ class GuildVoiceSession():
     async def _player_loop(self):
         try:
             while True:
-                audio_bytes = await self.queue.get()
+                item = await self.queue.get()
+                audio_bytes, volume = item if isinstance(item, tuple) else (item, 1.0)
                 try:
                     try:
-                        await self._play_one(audio_bytes)
+                        await self._play_one(audio_bytes, volume)
                     finally:
                         self.queue.task_done()
                     self.last_activity = time.monotonic()
@@ -474,7 +477,7 @@ class GuildVoiceSession():
         except asyncio.CancelledError:
             return
             
-    async def _play_one(self, audio_bytes: bytes):
+    async def _play_one(self, audio_bytes: bytes, volume: float = 1.0):
         vc = self.voice_client
         if not vc or not vc.is_connected():
             return
@@ -494,6 +497,9 @@ class GuildVoiceSession():
                 executable=FFMPEG_BIN,
                 before_options='-nostdin',   # avoid ffmpeg reading from stdin
             )
+            if abs(volume - 1.0) > 1e-3:
+                # Applied at playback, so it works the same for every provider and for saved voicelines
+                source = discord.PCMVolumeTransformer(source, volume=volume)
             vc.play(source, after=_after)
 
             try:
@@ -914,7 +920,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     # ---------- DB Helpers ----------
     async def _get_pref(self, guild_id: int, user_id: int) -> Optional[dict]:
         row = await self.db.fetchrow("""
-            SELECT guild_id, user_id, text_channel_id, voice, voice_label, style, rate, enabled
+            SELECT guild_id, user_id, text_channel_id, voice, voice_label, style, rate, volume, enabled
             FROM narrate_prefs
             WHERE guild_id=$1 AND user_id=$2""",
             guild_id, user_id
@@ -1531,7 +1537,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     async def narrate_status(self, ctx: commands.Context):
         rows = await self.db.fetch(
             """
-            SELECT user_id, voice, voice_label, style, rate
+            SELECT user_id, voice, voice_label, style, rate, volume
             FROM narrate_prefs
             WHERE guild_id=$1 AND enabled=TRUE
             ORDER BY user_id
@@ -1558,7 +1564,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 rate_val = r["rate"]
                 rate_str = f"{DEFAULT_RATE if rate_val is None else rate_val}"
                 style_str = f" | style: {r['style']}" if r["style"] else ""
-                lines.append(f"- {username} | {v} | {rate_str}{style_str}")
+                vol_str = f" | volume: {r['volume']}%" if r["volume"] not in (None, 100) else ""
+                lines.append(f"- {username} | {v} | {rate_str}{vol_str}{style_str}")
 
         # Several users with long styles can pass Discord's 2000-char limit
         buf = ""
@@ -1723,11 +1730,15 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         await self._apply_voice(ctx, ref, label[:256], provider_name[:300])
 
     @narrate_root.command(name="style")
-    async def narrate_style(self, ctx: commands.Context, *, style: str):
-        """Default delivery style for your messages (Fish & Gemini voices). 'off' clears it."""
-        style = _collapse_ws(style).strip("[]")
-        clear = style.lower() in {"off", "none", "clear", "reset"}
+    async def narrate_style(self, ctx: commands.Context, *, style: Optional[str] = None):
+        """Default delivery style for your messages (Fish & Gemini voices). No text (or 'off') clears it."""
+        style = _collapse_ws(style or "").strip("[]").strip()
+        clear = style.lower() in {"", "off", "none", "clear", "reset"}
         pref = await self._get_pref(ctx.guild.id, ctx.author.id)
+        if clear and not (pref or {}).get("style"):
+            return await ctx.send(f"You don't have a default style. Set one with "
+                                  f"`{ctx.clean_prefix}narrate style <text>`, e.g. `dry and sarcastic`.",
+                                  suppress_embeds=True)
         if not pref:
             # Create the row (with defaults) so there's somewhere to store the style
             await self._upsert_pref(ctx, ctx.channel.id, DEFAULT_VOICE, DEFAULT_RATE, False)
@@ -2396,6 +2407,30 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         await self._upsert_pref(ctx, channel_id, voice, rate_val, enabled)
         await ctx.send(f"Speaking rate set to `{rate_val}`.", suppress_embeds=True)
             
+    @narrate_root.command(name="volume", aliases=["vol"])
+    async def narrate_volume(self, ctx: commands.Context, *, volume: Optional[str] = None):
+        """How loud your messages play, in percent (100 is normal)."""
+        pref = await self._get_pref(ctx.guild.id, ctx.author.id)
+        current = (pref or {}).get("volume") or 100
+        if volume is None:
+            return await ctx.send(f"Your volume is **{current}%**. Change it with "
+                                  f"`{ctx.clean_prefix}narrate volume <{VOLUME_MIN}-{VOLUME_MAX}>`.", suppress_embeds=True)
+        try:
+            value = float(volume.strip().rstrip("%"))
+        except ValueError:
+            value = float("nan")
+        if not math.isfinite(value) or not (VOLUME_MIN <= value <= VOLUME_MAX):
+            return await ctx.send(f"Volume is a percentage from {VOLUME_MIN} to {VOLUME_MAX} (100 is normal), "
+                                  f"e.g. `{ctx.clean_prefix}narrate volume 150`.", suppress_embeds=True)
+        value = int(round(value))
+        if not pref:
+            # Create the row (with defaults) so there's somewhere to store the volume
+            await self._upsert_pref(ctx, ctx.channel.id, DEFAULT_VOICE, DEFAULT_RATE, False)
+        await self.db.execute(
+            "UPDATE narrate_prefs SET volume=$3, updated_at=CURRENT_TIMESTAMP WHERE guild_id=$1 AND user_id=$2",
+            ctx.guild.id, ctx.author.id, value)
+        await ctx.send(f"Volume set to **{value}%**.", suppress_embeds=True)
+
     @narrate_root.command(name="shutoff")
     @commands.has_permissions(manage_guild=True)
     async def narrate_shutoff(self, ctx: commands.Context):
@@ -2536,7 +2571,10 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             voice = DEFAULT_GOOGLE_VOICE
             await self._notify_fallback(message.guild, message.channel.id, "user_quota")
         gen = self._get_session(message.guild.id).generation
-        self._enqueue_narration(message.guild.id, (message.author.id, cleaned, voice, style, rate, message.channel.id, gen))
+        vol = pref.get("volume")
+        volume = (vol if vol and VOLUME_MIN <= vol <= VOLUME_MAX else 100) / 100
+        self._enqueue_narration(message.guild.id,
+                                (message.author.id, cleaned, voice, style, rate, message.channel.id, gen, volume))
 
     @narrate_root.command(name="save")
     async def narrate_save(self, ctx: commands.Context, *, voiceline_name: str):
@@ -2759,7 +2797,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             return
 
     async def _narrate_one(self, guild_id: int, user_id: int, text: str, voice: str, style: Optional[str],
-                           rate: float, channel_id: int, gen: int):
+                           rate: float, channel_id: int, gen: int, volume: float = 1.0):
         if not text:
             return
         guild = self.bot.get_guild(guild_id)
@@ -2804,7 +2842,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
         if voiceline_data:
             self._last_narrated_audio[(guild_id, user_id)] = [(voiceline_data, "ogg_opus")]
-            await session.enqueue(voiceline_data)
+            await session.enqueue(voiceline_data, volume)
             return
 
         # NO voiceline data -- do normal tts api call
@@ -2835,7 +2873,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                     return
                 await self._add_spend(guild_id, user_id, res.cost_usd)
                 clips.append((res.audio, res.fmt))
-                await session.enqueue(res.audio)
+                await session.enqueue(res.audio, volume)
         except Exception as e:
             ch = guild.get_channel(channel_id)
             if ch:

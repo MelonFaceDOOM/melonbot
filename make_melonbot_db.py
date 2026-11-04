@@ -109,7 +109,8 @@ def make_db():
     cur.execute("""
         ALTER TABLE narrate_prefs
           ADD COLUMN IF NOT EXISTS voice_label VARCHAR(256),
-          ADD COLUMN IF NOT EXISTS style       VARCHAR(200)""")
+          ADD COLUMN IF NOT EXISTS style       VARCHAR(200),
+          ADD COLUMN IF NOT EXISTS volume      SMALLINT""")
     cur.execute("""CREATE TABLE IF NOT EXISTS tts_usage (
                 month     DATE NOT NULL,
                 provider  VARCHAR(16) NOT NULL,

@@ -587,6 +587,23 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         await self.cog._refine_design(view, dm)
         self.cog._design_round.assert_not_awaited()
 
+    async def test_plain_style_command_clears_it(self):
+        self.cog._set_style = AsyncMock()
+        ctx = Mock(clean_prefix="!")
+        ctx.guild.id, ctx.author.id = 1, 2
+        ctx.send = AsyncMock()
+        self.cog._get_pref.return_value = {"enabled": True, "text_channel_id": 5, "style": "dry and sarcastic"}
+        await self.cog.narrate_style.callback(self.cog, ctx)
+        self.cog._set_style.assert_awaited_once_with(1, 2, None)
+        self.assertIn("cleared", ctx.send.await_args.args[0])
+        self.cog._set_style.reset_mock()
+        self.cog._get_pref.return_value = {"enabled": True, "text_channel_id": 5, "style": None}
+        await self.cog.narrate_style.callback(self.cog, ctx)          # nothing to clear
+        self.cog._set_style.assert_not_awaited()
+        self.assertIn("don't have a default style", ctx.send.await_args.args[0])
+        await self.cog.narrate_style.callback(self.cog, ctx, style="[very sad]")
+        self.cog._set_style.assert_awaited_once_with(1, 2, "very sad")
+
     async def test_tune_style_and_feel(self):
         row = {"voice_id": "aaa", "title": "Melon", "sample_path": None, "kind": "clone",
                "default_style": None, "temperature": None}
@@ -611,6 +628,41 @@ class CogTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.cog._voice_settings("aaa"), ("warm", 0.45))
         self.assertEqual(db.fetchrow.await_count, 1)   # cached
         self.assertIs(self.cog.router.voice_settings_loader.__func__, bot_narrate.NarrationCog._voice_settings)
+
+    async def test_volume_command(self):
+        db = Mock()
+        db.execute = AsyncMock()
+        self.bot.db_pool = db
+        self.cog._get_pref.return_value = {"enabled": True, "text_channel_id": 5, "volume": None}
+        ctx = Mock(clean_prefix="!")
+        ctx.guild.id, ctx.author.id = 1, 2
+        ctx.send = AsyncMock()
+        await self.cog.narrate_volume.callback(self.cog, ctx, volume="150%")
+        self.assertEqual(db.execute.await_args.args[1:], (1, 2, 150))
+        db.execute.reset_mock()
+        for bad in ("5", "300", "loud"):
+            await self.cog.narrate_volume.callback(self.cog, ctx, volume=bad)
+        db.execute.assert_not_awaited()
+        self.assertIn("percentage", ctx.send.await_args.args[0])
+        await self.cog.narrate_volume.callback(self.cog, ctx)
+        self.assertIn("100%", ctx.send.await_args.args[0])
+
+    async def test_volume_reaches_playback(self):
+        await self.cog._narrate_one(1, 2, "hello there", "en-US-Wavenet-D", None, 1.0, 5,
+                                    self.session.generation, 1.5)
+        self.assertEqual(self.session.enqueue.await_args.args[1], 1.5)
+        sess = bot_narrate.GuildVoiceSession(Mock(), 1, Mock())
+        vc = Mock()
+        vc.is_connected.return_value = True
+        vc.play.side_effect = lambda source, after: after(None)
+        sess.voice_client = vc
+        with patch.object(bot_narrate.discord, "FFmpegPCMAudio", Mock()), \
+             patch.object(bot_narrate.discord, "PCMVolumeTransformer", Mock()) as transformer:
+            await asyncio.wait_for(sess._play_one(OGG, 1.5), timeout=2)
+            self.assertEqual(transformer.call_args.kwargs["volume"], 1.5)
+            transformer.reset_mock()
+            await asyncio.wait_for(sess._play_one(OGG, 1.0), timeout=2)
+            transformer.assert_not_called()   # normal volume: no extra processing
 
     def test_bot_commands_are_not_narrated(self):
         bot = Mock(command_prefix="!")

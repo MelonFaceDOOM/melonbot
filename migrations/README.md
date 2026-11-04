@@ -136,7 +136,7 @@ ORDER BY table_name;
 
 Adds Fish Audio and Gemini TTS alongside Google for `!narrate`:
 
-- `narrate_prefs.voice_label` (display name for Fish/Gemini voices), `narrate_prefs.style` (default delivery style)
+- `narrate_prefs.voice_label` (display name for Fish/Gemini voices), `narrate_prefs.style` (default delivery style), `narrate_prefs.volume` (playback volume %, `!narrate volume`)
 - `tts_usage` — month-to-date estimated spend per paid provider; narration falls back to Google once the shared `TTS_MONTHLY_BUDGET_USD` cap is reached
 - `tts_user_usage` — month-to-date estimated spend per user; one user can use at most half the cap before their messages fall back to Google
 - `tts_guild_usage` — month-to-date estimated spend per server, shown by `!narrate quota`
