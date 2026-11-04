@@ -161,6 +161,10 @@ def make_db():
     cur.execute("""ALTER TABLE tts_designed_voices ALTER COLUMN guild_id DROP NOT NULL""")
     cur.execute("""ALTER TABLE tts_designed_voices ADD COLUMN IF NOT EXISTS kind VARCHAR(16) NOT NULL DEFAULT 'design'""")
     cur.execute("""DROP INDEX IF EXISTS tts_designed_voices_one_clone_ux""")
+    cur.execute("""
+        ALTER TABLE tts_designed_voices
+          ADD COLUMN IF NOT EXISTS default_style VARCHAR(200),
+          ADD COLUMN IF NOT EXISTS temperature   REAL""")
     cur.execute("""CREATE INDEX IF NOT EXISTS tts_designed_voices_user_idx
                 ON tts_designed_voices (guild_id, user_id)""")
 

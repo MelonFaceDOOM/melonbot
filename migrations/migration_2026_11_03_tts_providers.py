@@ -107,6 +107,12 @@ DDL = [
     """
     DROP INDEX IF EXISTS tts_designed_voices_one_clone_ux
     """,
+    # Per-voice defaults set by the creator with `!narrate tune`: built-in style and Fish temperature
+    """
+    ALTER TABLE tts_designed_voices
+      ADD COLUMN IF NOT EXISTS default_style VARCHAR(200),
+      ADD COLUMN IF NOT EXISTS temperature   REAL
+    """,
     """
     CREATE INDEX IF NOT EXISTS tts_designed_voices_user_idx
         ON tts_designed_voices (guild_id, user_id)

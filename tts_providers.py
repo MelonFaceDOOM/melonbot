@@ -50,6 +50,8 @@ FISH_REF_PREFIX = "ref:"   # fish:ref:<key> = designed voice kept as a local sam
 # ==========================
 FISH_USD_PER_M_BYTES = {"s2.1-pro": 15.0, "s2-pro": 15.0, "s2.1-pro-free": 0.0, "drama-3": 50.0}
 FISH_VOICE_DESIGN_USD = 0.01
+# Per-voice "feel" -> Fish sampling temperature (0-1; Fish's default is 0.7). Lower = more consistent delivery.
+FISH_FEEL_TEMPERATURE = {"steady": 0.45, "normal": None, "lively": 0.9}
 GEMINI_AUDIO_TOKENS_PER_SEC = 25
 # model: (text input per 1M tokens, audio output per 1M tokens); introductory prices end 2026-12-31
 GEMINI_USD_PER_M_TOKENS = {
@@ -351,16 +353,22 @@ class FishTTSProvider(_HttpProvider):
         return {"Authorization": f"Bearer {self.api_key}"}
 
     async def synth(self, text: str, voice_id: Optional[str], speed: float = 1.0,
-                    reference: Optional[Tuple[bytes, str]] = None) -> bytes:
-        """Speak with a voice model (voice_id) or, for unsaved voices, an inline (audio, transcript) sample."""
+                    reference=None, temperature: Optional[float] = None) -> bytes:
+        """
+        Speak with a voice model (voice_id) or, for unsaved voices, inline sample(s): `reference` is one
+        (audio, transcript) pair or a list of them. temperature: 0-1, lower = steadier delivery.
+        """
         body = {"text": text, "format": "opus", "latency": "balanced"}
         if abs(speed - 1.0) > 1e-3:
             body["prosody"] = {"speed": min(2.0, max(0.5, float(speed)))}
+        if temperature is not None:
+            body["temperature"] = min(1.0, max(0.0, float(temperature)))
         headers = {**self._auth(), "model": self.model}
         if reference:
             # Inline references are only accepted as MessagePack
             import msgpack
-            body["references"] = [{"audio": reference[0], "text": reference[1]}]
+            refs = reference if isinstance(reference, list) else [reference]
+            body["references"] = [{"audio": a, "text": t} for a, t in refs]
             kw = {"data": msgpack.packb(body), "headers": {**headers, "Content-Type": "application/msgpack"}}
         else:
             body["reference_id"] = voice_id
@@ -400,9 +408,15 @@ class FishTTSProvider(_HttpProvider):
         self._model_cache[model_id] = info
         return info
 
-    async def design(self, instruction: str, reference_text: str, n: int = 3) -> List[dict]:
-        """Voice design candidates: [{id, index, audio (bytes), duration_ms, ...}]."""
-        body = {"instruction": instruction[:2000], "reference_text": reference_text[:150], "n": max(1, min(4, n))}
+    async def design(self, instruction: str, reference_text: str, n: int = 4, seed: Optional[int] = None) -> List[dict]:
+        """
+        Voice design candidates: [{id, index, audio (bytes), duration_ms, ...}]. Billed per request, not per
+        candidate, so asking for the max (4) is free. Fish documents `seed` as deterministic, but in testing the
+        same seed + instruction still gave different takes, so don't rely on it to reproduce a voice.
+        """
+        body = {"instruction": instruction[:2000], "reference_text": reference_text[:300], "n": max(1, min(4, n))}
+        if seed is not None:
+            body["seed"] = int(seed)
         session = await self._sess()
         async with session.post(FISH_VOICE_DESIGN_ENDPOINT, json=body,
                                 headers={**self._auth(), "model": "voice-design-1"},
@@ -417,20 +431,25 @@ class FishTTSProvider(_HttpProvider):
             out.append(c)
         return out
 
-    async def create_model(self, title: str, audio: bytes, text: str, signature: Optional[str] = None,
+    async def create_model(self, title: str, audio, text, signature: Optional[str] = None,
                            description: Optional[str] = None) -> dict:
-        """Create a private voice model from one sample (e.g. a voice design candidate)."""
+        """Create a private voice model from one sample, or several (lists of audio + matching transcripts)."""
+        audios = audio if isinstance(audio, list) else [audio]
+        texts = text if isinstance(text, list) else [text]
+
         def form(sig: Optional[str]) -> aiohttp.FormData:
             f = aiohttp.FormData()
             f.add_field("type", "tts")
             f.add_field("title", title[:100])
             f.add_field("train_mode", "fast")
             f.add_field("visibility", "private")
-            f.add_field("texts", text)
+            for t in texts:
+                f.add_field("texts", t)
             if description:
                 f.add_field("description", description[:500])
-            ext = {"wav": "wav", "ogg_opus": "ogg", "mp3": "mp3"}.get(audio_format(audio), "wav")
-            f.add_field("voices", audio, filename=f"sample.{ext}", content_type="application/octet-stream")
+            for i, a in enumerate(audios):
+                ext = {"wav": "wav", "ogg_opus": "ogg", "mp3": "mp3"}.get(audio_format(a), "wav")
+                f.add_field("voices", a, filename=f"sample_{i}.{ext}", content_type="application/octet-stream")
             if sig:
                 f.add_field("voice_design_signatures", sig)
             return f
@@ -756,6 +775,8 @@ class TTSRouter:
         self._cache = LRUCache(CACHE_MAX_ITEMS, max_bytes=64 * 1024 * 1024)
         # Unsaved Fish voices ('fish:ref:<key>') are spoken from a stored sample; loader returns (audio, transcript)
         self._reference_loader = reference_loader
+        # Per-voice defaults for Fish voices (designed/cloned): async (voice_id) -> (default style, temperature)
+        self.voice_settings_loader: Optional[Callable[[str], Awaitable[Optional[Tuple[Optional[str], Optional[float]]]]]] = None
         self._references: Dict[str, Tuple[bytes, str]] = {}
 
     def forget_reference(self, voice_id: str) -> None:
@@ -841,20 +862,33 @@ class TTSRouter:
         return None
 
     async def _synth_paid(self, provider, client, voice_id, text, style, rate) -> SynthResult:
+        temperature = None
+        if provider == "fish" and self.voice_settings_loader:
+            try:
+                settings = await self.voice_settings_loader(voice_id)
+            except Exception as e:
+                print(f"[tts] couldn't load voice settings for {voice_id}: {e}")
+                settings = None
+            if settings:
+                voice_style, temperature = settings
+                # The voice's own style comes first; the user's/message's delivery is added on top
+                if voice_style:
+                    style = f"{voice_style}, {style}" if style else voice_style
         prepared, sep_style = tts_text.prepare(text, provider, style)
         if not prepared:
             raise ValueError("nothing to say after removing tags")
-        key = (provider, voice_id, prepared, sep_style, round(float(rate), 2))
+        key = (provider, voice_id, prepared, sep_style, round(float(rate), 2), temperature)
         cached = self._cache.get(key)
         if cached is not None:
             return SynthResult(cached, audio_format(cached), provider, None, model="cache")
 
         if provider == "fish":
+            extra = {"temperature": temperature} if temperature is not None else {}
             if voice_id.startswith(FISH_REF_PREFIX):
                 sample = await self._reference(voice_id[len(FISH_REF_PREFIX):])
-                audio = await client.synth(prepared, None, speed=rate, reference=sample)
+                audio = await client.synth(prepared, None, speed=rate, reference=sample, **extra)
             else:
-                audio = await client.synth(prepared, voice_id, speed=rate)
+                audio = await client.synth(prepared, voice_id, speed=rate, **extra)
             cost = fish_cost(prepared, client.model)
             model = client.model
             await self.budget.record("fish", cost, chars=len(prepared))

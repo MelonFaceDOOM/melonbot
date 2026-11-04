@@ -49,6 +49,13 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.google.synth.assert_not_awaited()
         self.assertGreater(await self.budget.spent(), 0)
 
+    async def test_voice_builtin_style_and_feel_apply_to_fish(self):
+        self.router.voice_settings_loader = AsyncMock(return_value=("warm, slightly raspy", 0.45))
+        await self.router.synth(f"fish:{FISH_ID}", "hello", style="excited")
+        self.fish.synth.assert_awaited_once_with("[warm, slightly raspy, excited] hello", FISH_ID, speed=1.0,
+                                                 temperature=0.45)
+        self.router.voice_settings_loader.assert_awaited_once_with(FISH_ID)
+
     async def test_gemini_voice_sends_style_separately(self):
         res = await self.router.synth("gemini:kore", "ok [laugh]", style="dry")
         self.assertEqual((res.provider, res.fmt), ("gemini", "wav"))

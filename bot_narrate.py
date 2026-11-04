@@ -4,6 +4,7 @@ from pathlib import Path
 import time
 import io
 import math
+import random
 import traceback
 import subprocess
 from datetime import date, timedelta
@@ -20,7 +21,7 @@ from db_mixin import DbMixin
 from tts_providers import (
     BudgetTracker, FishTTSProvider, GeminiTTSProvider, GoogleTTSProvider, LRUCache, TTSRouter,
     DEFAULT_GOOGLE_VOICE, DEFAULT_LANG, DEFAULT_RATE, FISH_REF_PREFIX, FISH_VOICE_DESIGN_USD, ProviderError,
-    fish_cost,
+    fish_cost, FISH_FEEL_TEMPERATURE,
     GEMINI_MODEL_ALIASES, GEMINI_MODEL_LABELS, audio_format, extract_fish_id, parse_voice_ref,
     resolve_gemini_model, split_gemini_voice,
 )
@@ -52,6 +53,9 @@ DESIGN_COOLDOWN_SECS = 60                   # per user, for !narrate design
 DESIGN_PREVIEW_LINE = ("Hey everyone, it's me. I have some news, and honestly, you are not going to believe it. "
                        "Pull up a chair, because this one is a long story.")
 DESIGN_VIEW_TIMEOUT = 600
+DESIGN_TAKES = 4                 # Fish bills per design request, not per take, so ask for the max
+DESIGN_MAX_REFINES = 6
+DESIGN_MAX_DESCRIPTION = 1500
 # narrate subcommands that also work in a DM with the bot (designing a voice privately)
 DM_COMMANDS = frozenset({"narrate", "design", "designs", "clone"})
 
@@ -66,6 +70,11 @@ CLONE_MAX_BYTES = 15 * 1024 * 1024
 CLONE_WAIT_SECS = 600            # how long the bot waits for the recording
 CLONE_COOLDOWN_SECS = 60
 CLONE_MAX_ATTEMPTS = 8           # recordings per clone session
+CLONE_LIVELY_MIN_SECS = 5
+# Optional second take, read with energy: gives the clone some range beyond a calm reading
+CLONE_LIVELY_SCRIPT = ("No way, are you serious? That's amazing! Okay, okay, tell me everything. "
+                       "Wait, hold on, I need to sit down for this one.")
+VOICE_FEELS = ("steady", "normal", "lively")
 CLONE_PREVIEW_LINE = "Hey everyone, it's me. This is what I sound like now, so let me know what you think."
 WHISPER_MODEL = "base.en"
 
@@ -193,8 +202,9 @@ HELP_SECTIONS = [
         ("style <text | off>", "default delivery for your messages, e.g. `dry and sarcastic`"),
     ]),
     ("🎨 Make your own", [
-        ("design <description>", "invent a voice. I DM you 3 takes to pick from, privately"),
-        ("designs", "your designed voices, usable in any server"),
+        ("design <description>", "invent a voice. I DM you 4 takes to pick from (or refine), privately"),
+        ("designs", "your designed and cloned voices, usable in any server"),
+        ("tune <your voice> style|feel …", "give one of your voices a built-in style, or a steady/normal/lively feel"),
         ("clone", "turn a recording of YOUR voice into a named, public voice (by DM, with a preview first). "
                   "`voice clone <name>` uses one, `clone delete <name>` removes it"),
     ]),
@@ -259,6 +269,13 @@ def _gemini_model_choices() -> str:
             seen.add(model)
             names.append(f"`{alias}`")
     return " ".join(names)
+
+def _feel_name(temperature: Optional[float]) -> str:
+    """Stored temperature (a REAL, so 0.45 comes back as 0.4499...) -> steady/normal/lively."""
+    if temperature is None:
+        return "normal"
+    return next((f for f, t in FISH_FEEL_TEMPERATURE.items() if t is not None and abs(t - temperature) < 0.01),
+                "custom")
 
 def _usd_bar(spent: float, cap: float, width: int = 12) -> str:
     """Text progress bar like '███░░░░░░░░░ 24%'."""
@@ -621,9 +638,9 @@ class _ClonePreviewView(discord.ui.View):
 # Voice design picker
 # ==========================
 class _DesignPickView(discord.ui.View):
-    """Buttons under a !narrate design result (sent by DM): pick a candidate (designer only) or cancel."""
+    """Buttons under a !narrate design result (sent by DM): pick a take, refine them, or cancel (designer only)."""
     def __init__(self, cog: "NarrationCog", owner_id: int, origin_guild_id: Optional[int], prefix: str,
-                 description: str, candidates: List[dict]):
+                 description: str, candidates: List[dict], seed: Optional[int] = None, round_no: int = 0):
         super().__init__(timeout=DESIGN_VIEW_TIMEOUT)
         self.cog = cog
         self.owner_id = owner_id
@@ -631,11 +648,16 @@ class _DesignPickView(discord.ui.View):
         self.prefix = prefix
         self.description = description
         self.candidates = candidates
+        self.seed = seed
+        self.round_no = round_no
         self.message: Optional[discord.Message] = None
         for i in range(len(candidates)):
             btn = discord.ui.Button(label=f"Use {i + 1}", style=discord.ButtonStyle.primary)
             btn.callback = self._make_pick(i)
             self.add_item(btn)
+        refine = discord.ui.Button(label="Refine", style=discord.ButtonStyle.success)
+        refine.callback = self._refine
+        self.add_item(refine)
         cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.secondary)
         cancel.callback = self._cancel
         self.add_item(cancel)
@@ -665,10 +687,16 @@ class _DesignPickView(discord.ui.View):
             await interaction.followup.send(
                 f"Saved take {index + 1} of **{self.description[:100]}** to your voices. Nobody else has heard it.\n"
                 f"When you're ready, use it in any server with `{self.prefix}narrate voice {ref}` "
-                f"(`{self.prefix}narrate designs` lists all of yours).",
+                f"(`{self.prefix}narrate designs` lists all of yours; `{self.prefix}narrate tune` gives it a default "
+                f"style or feel).",
                 suppress_embeds=True,
             )
         return pick
+
+    async def _refine(self, interaction: discord.Interaction):
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        await self.cog._refine_design(self, interaction.channel)
 
     async def _cancel(self, interaction: discord.Interaction):
         self._disable_all()
@@ -729,6 +757,9 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         self._design_last_used: Dict[int, float] = {}
         self._clone_last_used: Dict[int, float] = {}
         self._whisper = None  # faster-whisper model, loaded on first clone
+        # voice_id -> (monotonic time, (default style, temperature)) for designed/cloned voices
+        self._voice_settings_cache: Dict[str, Tuple[float, Optional[Tuple[Optional[str], Optional[float]]]]] = {}
+        self.router.voice_settings_loader = self._voice_settings
 
     async def cog_load(self):
         try:
@@ -1789,29 +1820,65 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         if ctx.guild:
             await ctx.send("📬 Check your DMs, I'm sending the samples there.", suppress_embeds=True)
         self._design_last_used[ctx.author.id] = now
+        seed = random.randrange(1, 2_000_000_000)
+        await self._design_round(ctx.author.id, dm, ctx.clean_prefix, guild_id, description, seed, 0)
 
+    async def _design_round(self, owner_id: int, dm, prefix: str, guild_id: Optional[int], description: str,
+                            seed: int, round_no: int) -> None:
+        """Generate takes for `description` (same seed across refinements) and post them with the picker."""
         async with dm.typing():
             try:
-                candidates = await self.fish.design(description, DESIGN_PREVIEW_LINE, n=3)
+                candidates = await self.fish.design(description, DESIGN_PREVIEW_LINE, n=DESIGN_TAKES, seed=seed)
             except Exception as e:
                 print(f"[narrate] voice design failed: {e}")
-                return await dm.send("Voice design failed; try a different description.", suppress_embeds=True)
+                await dm.send("Voice design failed; try a different description.", suppress_embeds=True)
+                return
         await self.budget.record("fish", FISH_VOICE_DESIGN_USD)
-        await self._add_spend(guild_id, ctx.author.id, FISH_VOICE_DESIGN_USD)
+        await self._add_spend(guild_id, owner_id, FISH_VOICE_DESIGN_USD)
         candidates = [c for c in candidates if c.get("audio")]
         if not candidates:
-            return await dm.send("Fish didn't return any voices for that; try rewording it.", suppress_embeds=True)
+            await dm.send("Fish didn't return any voices for that; try rewording it.", suppress_embeds=True)
+            return
 
         files = []
         for i, c in enumerate(candidates, 1):
             ext = {"wav": "wav", "ogg_opus": "ogg", "mp3": "mp3"}.get(audio_format(c["audio"]), "wav")
             files.append(discord.File(io.BytesIO(c["audio"]), filename=f"voice_{i}.{ext}"))
-        view = _DesignPickView(self, ctx.author.id, guild_id, ctx.clean_prefix, description, candidates)
+        view = _DesignPickView(self, owner_id, guild_id, prefix, description, candidates, seed, round_no)
+        intro = (f"Here are {len(candidates)} takes on **{description[:300]}**." if round_no == 0 else
+                 f"Refined ({round_no}): **{description[:300]}**. New takes from the updated description.")
         view.message = await dm.send(
-            f"Here are {len(candidates)} takes on **{description[:200]}**. Listen, then pick one to save it. "
-            f"It won't change your voice until you choose it.",
+            f"{intro} Listen, then pick one to save it (it won't change your voice until you choose it), "
+            f"or **Refine** to adjust the description and get new takes.\n"
+            f"-# Good descriptions cover age, tone, accent, pacing, delivery and context.",
             files=files, view=view, suppress_embeds=True,
         )
+
+    async def _refine_design(self, view: "_DesignPickView", dm) -> None:
+        """Ask what to change, then generate new takes from the description with that change added.
+        (Fish accepts a seed but doesn't currently reproduce takes with it, so refining can't keep the exact voices.)"""
+        if view.round_no >= DESIGN_MAX_REFINES:
+            await dm.send(f"That's a lot of refining; pick one of these, or start fresh with `{view.prefix}narrate design`.")
+            return
+        if await self.budget.exhausted() or await self._over_user_share(view.owner_id):
+            await dm.send("The voice budget is used up for now, so refining is off until next month.")
+            return
+        await dm.send("What should change? One thing at a time works best, e.g. `older`, `more gravelly`, "
+                      "`slower and calmer`, `British accent`. (`cancel` to stop)")
+        try:
+            msg = await self.bot.wait_for(
+                "message", timeout=DESIGN_VIEW_TIMEOUT,
+                check=lambda m: m.author.id == view.owner_id and m.channel.id == dm.id and bool((m.content or "").strip()))
+        except asyncio.TimeoutError:
+            await dm.send("I didn't hear back, so I stopped refining.")
+            return
+        change = " ".join(msg.content.split())
+        if change.lower() == "cancel":
+            await dm.send("Okay, stopped refining.")
+            return
+        description = f"{view.description}; {change}"[:DESIGN_MAX_DESCRIPTION]
+        await self._design_round(view.owner_id, dm, view.prefix, view.origin_guild_id, description,
+                                 view.seed, view.round_no + 1)
 
     async def _save_designed_voice(self, owner_id: int, origin_guild_id: Optional[int], description: str,
                                    candidate: dict) -> str:
@@ -1930,14 +1997,21 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             audio = await att.read()
             try:
                 async with dm.typing():
-                    sample, transcript = await self._check_recording(audio)
-                    preview = await self._clone_preview(user.id, sample, transcript)
+                    takes = [await self._check_recording(audio)]
             except _CloneRejected as e:
                 await dm.send(f"{e} Send another recording (or `cancel`).", suppress_embeds=True)
                 continue
+            lively = await self._ask_lively_take(user, dm, next_message)
+            if lively is False:        # cancelled / timed out
+                return
+            if lively:
+                takes.append(lively)
+            try:
+                async with dm.typing():
+                    preview = await self._clone_preview(user.id, takes)
             except Exception as e:
                 print(f"[narrate] clone preview failed: {e!r}")
-                await dm.send("Something went wrong making the preview. Send the recording again (or `cancel`).")
+                await dm.send("Something went wrong making the preview. Send the first recording again (or `cancel`).")
                 continue
 
             view = _ClonePreviewView(user.id)
@@ -1948,7 +2022,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
                 return await dm.send("Okay, nothing was saved." if view.choice == "cancel"
                                      else f"I didn't hear back, so nothing was saved. `{prefix}narrate clone` to start again.")
             if view.choice == "redo":
-                await dm.send("No problem, send a new recording.")
+                await dm.send("No problem, send a new recording of the first script.")
                 continue
             break  # keep
 
@@ -1957,7 +2031,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             return
         try:
             async with dm.typing():
-                ref = await self._save_clone(user, sample, transcript, name)
+                ref = await self._save_clone(user, takes, name)
         except Exception as e:
             print(f"[narrate] saving clone failed: {e!r}")
             return await dm.send("Something went wrong saving the voice; try again in a bit.")
@@ -1967,6 +2041,37 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             f"Use it in a server: `{prefix}narrate voice clone {name}` (or `{prefix}narrate voice {ref}`, which "
             f"anyone can use). Remove it: `{prefix}narrate clone delete {name}`.",
             suppress_embeds=True)
+
+    async def _ask_lively_take(self, user, dm, next_message):
+        """Optional second take with energy. Returns (ogg, transcript), None if skipped, False if cancelled."""
+        await dm.send(
+            "👍 Got it. **Optional but recommended:** send a second take reading this one *with energy*, so your "
+            "clone can do more than calm:\n"
+            f"> {CLONE_LIVELY_SCRIPT}\n"
+            "Or type `skip`.")
+        while True:
+            msg = await next_message()
+            if msg is None:
+                return False
+            text = (msg.content or "").strip().lower()
+            if text == "cancel":
+                await dm.send("Cancelled, nothing was saved.")
+                return False
+            if text == "skip":
+                return None
+            if not msg.attachments:
+                await dm.send("Send the second take as a voice message or audio file, or type `skip`.")
+                continue
+            att = msg.attachments[0]
+            if att.size > CLONE_MAX_BYTES:
+                await dm.send("That file is too big. Send a shorter take, or `skip`.")
+                continue
+            try:
+                async with dm.typing():
+                    return await self._check_recording(await att.read(), require_consent=False,
+                                                       min_secs=CLONE_LIVELY_MIN_SECS)
+            except _CloneRejected as e:
+                await dm.send(f"{e} Send it again, or `skip`.", suppress_embeds=True)
 
     async def _ask_clone_name(self, user, dm, next_message) -> Optional[str]:
         await dm.send("What should this voice be called? (up to 60 characters, e.g. `Melon, sleepy`)")
@@ -2006,7 +2111,8 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             return " ".join(s.text for s in segs).strip()
         return await asyncio.to_thread(run)
 
-    async def _check_recording(self, audio: bytes) -> Tuple[bytes, str]:
+    async def _check_recording(self, audio: bytes, require_consent: bool = True,
+                               min_secs: float = CLONE_MIN_SECS) -> Tuple[bytes, str]:
         """Length + consent check. Returns (recording as OGG/Opus, transcript); raises _CloneRejected with a reason."""
         try:
             samples = await asyncio.to_thread(_decode_16k_mono, audio)
@@ -2015,31 +2121,32 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         secs = len(samples) / 16000
         if secs < 0.5:
             raise _CloneRejected("I couldn't read any audio in that file. A voice message, .m4a, .mp3, .wav or .ogg works.")
-        if secs < CLONE_MIN_SECS:
-            raise _CloneRejected(f"That was only {secs:.0f}s; read the whole script ({CLONE_MIN_SECS}+ seconds).")
+        if secs < min_secs:
+            raise _CloneRejected(f"That was only {secs:.0f}s; read the whole script ({min_secs:.0f}+ seconds).")
         if secs > CLONE_MAX_SECS:
             raise _CloneRejected(f"That's over {CLONE_MAX_SECS // 60} minutes; the script alone is plenty.")
         transcript = await self._transcribe(samples)
-        if not _consent_heard(transcript):
+        if require_consent and not _consent_heard(transcript):
             raise _CloneRejected("I couldn't hear the consent sentence at the start "
                                  f"(\"{CLONE_CONSENT}\"). Make sure you read it clearly.")
         ogg = audio if audio_format(audio) == "ogg_opus" else await asyncio.to_thread(_transcode_to_ogg_opus, audio)
         return ogg, transcript
 
-    async def _clone_preview(self, user_id: int, sample: bytes, transcript: str) -> bytes:
-        """Speak a line in the would-be clone without saving anything (the recording is sent inline)."""
-        audio = await self.fish.synth(CLONE_PREVIEW_LINE, None, reference=(sample, transcript))
+    async def _clone_preview(self, user_id: int, takes: List[Tuple[bytes, str]]) -> bytes:
+        """Speak a line in the would-be clone without saving anything (the recordings are sent inline)."""
+        audio = await self.fish.synth(CLONE_PREVIEW_LINE, None, reference=list(takes))
         cost = fish_cost(CLONE_PREVIEW_LINE, self.fish.model)
         await self.budget.record("fish", cost, chars=len(CLONE_PREVIEW_LINE))
         await self._add_spend(None, user_id, cost)
         return audio
 
-    async def _save_clone(self, user, sample: bytes, transcript: str, name: str) -> str:
-        """Create the (public, named) voice; returns its ref. Falls back to a local sample if Fish refuses."""
+    async def _save_clone(self, user, takes: List[Tuple[bytes, str]], name: str) -> str:
+        """Create the (public, named) voice from all takes; returns its ref. Falls back to a local sample."""
         sample_path = None
+        transcript = " ".join(t for _, t in takes)
         try:
             info = await self.fish.create_model(
-                title=name[:100], audio=sample, text=transcript,
+                title=name[:100], audio=[a for a, _ in takes], text=[t for _, t in takes],
                 description="Cloned from the creator's own recording via !narrate clone.")
             voice_id = str(info["_id"]).lower()
         except ProviderError as e:
@@ -2048,6 +2155,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
             print(f"[narrate] fish model creation refused, keeping clone locally: {e}")
             key = uuid.uuid4().hex
             sample_path = f"cloned/user_{user.id}/{key}.ogg"
+            sample = takes[0][0] if len(takes) == 1 else await asyncio.to_thread(_join_to_ogg_opus, [a for a, _ in takes])
             root = Path(getattr(self, "persistent_audio_root", "data/audio"))
             await asyncio.to_thread(_atomic_write_bytes, root / sample_path, sample)
             voice_id = f"{FISH_REF_PREFIX}{key}"
@@ -2081,17 +2189,74 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
 
     async def _find_own_clone(self, user_id: int, name: Optional[str]):
         """(row or None, all of the user's clones) where row is the clone matching `name` (or the only one)."""
+        return await self._find_own_voice(user_id, name, kind="clone")
+
+    async def _find_own_voice(self, user_id: int, name: Optional[str], kind: Optional[str] = None):
+        """(row or None, candidates): the user's designed/cloned voice matching `name` (title or fish:<id>)."""
         rows = await self.db.fetch(
-            "SELECT voice_id, title, sample_path FROM tts_designed_voices WHERE kind='clone' AND user_id=$1 "
-            "ORDER BY created_at DESC", user_id)
+            "SELECT voice_id, title, sample_path, kind, default_style, temperature FROM tts_designed_voices "
+            "WHERE user_id=$1 AND ($2::text IS NULL OR kind=$2) ORDER BY created_at DESC", user_id, kind)
         rows = list(rows)
         if not name:
             return (rows[0] if len(rows) == 1 else None), rows
         q = " ".join(name.split()).lower()
+        by_id = [r for r in rows if q in (r["voice_id"], f"fish:{r['voice_id']}")]
         exact = [r for r in rows if r["title"].lower() == q]
         partial = [r for r in rows if q in r["title"].lower()]
-        match = exact[0] if exact else (partial[0] if len(partial) == 1 else None)
+        match = (by_id or exact or [None])[0] or (partial[0] if len(partial) == 1 else None)
         return match, rows
+
+    async def _voice_settings(self, voice_id: str) -> Optional[Tuple[Optional[str], Optional[float]]]:
+        """Router hook: a designed/cloned voice's own default style and temperature (cached briefly)."""
+        cached = self._voice_settings_cache.get(voice_id)
+        if cached and time.monotonic() - cached[0] < 300:
+            return cached[1]
+        row = await self.db.fetchrow(
+            "SELECT default_style, temperature FROM tts_designed_voices WHERE provider='fish' AND voice_id=$1",
+            voice_id)
+        # REAL column: 0.45 comes back as 0.4499..., so round
+        temp = round(row["temperature"], 2) if row and row["temperature"] is not None else None
+        settings = (row["default_style"], temp) if row and (row["default_style"] or temp is not None) else None
+        self._voice_settings_cache[voice_id] = (time.monotonic(), settings)
+        return settings
+
+    @narrate_root.command(name="tune")
+    async def narrate_tune(self, ctx: commands.Context, *, args: Optional[str] = None):
+        """Give one of your designed/cloned voices a built-in style or feel (applies to everyone using it)."""
+        p = ctx.clean_prefix
+        usage = (f"`{p}narrate tune <your voice> style <text|off>` e.g. `{p}narrate tune Melon style warm, slightly raspy`\n"
+                 f"`{p}narrate tune <your voice> feel <steady|normal|lively>` (steady = same every message, "
+                 f"lively = more expressive)\n`{p}narrate tune <your voice>` shows its settings.")
+        if not args:
+            return await ctx.send(usage, suppress_embeds=True)
+        m = re.match(r"(.+?)\s+(style|feel)\b\s*(.*)$", args.strip(), re.I | re.S)
+        name, what, value = (m.group(1), m.group(2).lower(), m.group(3).strip()) if m else (args.strip(), None, "")
+        row, rows = await self._find_own_voice(ctx.author.id, name)
+        if not rows:
+            return await ctx.send(f"You haven't made any voices yet (`{p}narrate design` or `{p}narrate clone`).",
+                                  suppress_embeds=True)
+        if not row:
+            names = ", ".join(f"`{r['title']}`" for r in rows[:15])
+            return await ctx.send(f"Couldn't tell which voice you mean. Yours: {names}", suppress_embeds=True)
+        title = discord.utils.escape_markdown(row["title"])
+        if what is None:
+            feel = _feel_name(row["temperature"])
+            return await ctx.send(f"**{title}** · style: {row['default_style'] or 'none'} · feel: {feel}\n{usage}",
+                                  suppress_embeds=True)
+        if what == "style":
+            style = None if value.lower() in ("", "off", "none", "clear", "reset") else value.strip("[]")[:200]
+            await self.db.execute("UPDATE tts_designed_voices SET default_style=$2 WHERE voice_id=$1",
+                                  row["voice_id"], style)
+            msg = f"**{title}** now always sounds **{style}**." if style else f"**{title}** has no built-in style now."
+        else:
+            feel = value.lower()
+            if feel not in VOICE_FEELS:
+                return await ctx.send(f"Feel is one of: {', '.join(VOICE_FEELS)}.", suppress_embeds=True)
+            await self.db.execute("UPDATE tts_designed_voices SET temperature=$2 WHERE voice_id=$1",
+                                  row["voice_id"], FISH_FEEL_TEMPERATURE[feel])
+            msg = f"**{title}** now has a **{feel}** feel."
+        self._voice_settings_cache.pop(row["voice_id"], None)
+        await ctx.send(msg + " This applies to everyone using it.", suppress_embeds=True)
 
     async def _delete_clone(self, ctx: commands.Context, name: Optional[str]):
         row, rows = await self._find_own_clone(ctx.author.id, name)
@@ -2194,7 +2359,7 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
     async def narrate_designs(self, ctx: commands.Context):
         rows = await self.db.fetch(
             """
-            SELECT voice_id, title, created_at, kind
+            SELECT voice_id, title, created_at, kind, default_style, temperature
             FROM tts_designed_voices
             WHERE user_id=$1
             ORDER BY created_at DESC
@@ -2208,7 +2373,12 @@ class NarrationCog(DbMixin, commands.Cog, name="Narrate"):
         lines = [f"Your voices, usable in any server with `{ctx.clean_prefix}narrate voice <id>`:"]
         for r in rows:
             tag = " 🎤 *cloned*" if r["kind"] == "clone" else ""
-            lines.append(f"- **{discord.utils.escape_markdown(r['title'])}**{tag}: `fish:{r['voice_id']}`")
+            extra = ""
+            if r["default_style"]:
+                extra += f" · style: {discord.utils.escape_markdown(r['default_style'])}"
+            if r["temperature"] is not None:
+                extra += f" · feel: {_feel_name(r['temperature'])}"
+            lines.append(f"- **{discord.utils.escape_markdown(r['title'])}**{tag}: `fish:{r['voice_id']}`{extra}")
         await ctx.send("\n".join(lines)[:1900], suppress_embeds=True)
 
     @narrate_root.command(name="rate")
