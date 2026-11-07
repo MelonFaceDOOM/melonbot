@@ -1,4 +1,5 @@
 import re
+import sys
 import datetime
 import asyncpg
 from random import choice
@@ -26,6 +27,14 @@ from bot_helpers import (
 )
 from bot_stream_tracker import StreamTrackerCog
 from db_mixin import DbMixin
+
+# Under systemd stdout is a pipe, so Python block-buffers it and a restart throws the buffer away.
+# Line buffering makes every print reach journalctl right away.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 class Core(DbMixin, commands.Cog):
     def __init__(self, bot):

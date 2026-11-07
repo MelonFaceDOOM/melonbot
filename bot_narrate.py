@@ -49,6 +49,8 @@ PLAYBACK_IDLE_DISCONNECT_SECS = 3600       # leave VC when idle
 DEFAULT_VOICE = f"fish:{FISH_DEFAULT_VOICE_ID.lower()}" if (FISH_DEFAULT_VOICE_ID and fish_api_key) else DEFAULT_GOOGLE_VOICE
 FFMPEG_BIN = "ffmpeg"
 PLAY_TIMEOUT = 120                          # max seconds per clip
+PLAY_POLL_SECS = 1.0                        # how often playback checks the voice connection
+VOICE_DOWN_GRACE_SECS = 8                   # voice down this long mid-clip -> rebuild the connection
 DESIGN_COOLDOWN_SECS = 60                   # per user, for !narrate design
 # Also the transcript Fish clones from for locally kept designs, so use most of the 150-char limit
 DESIGN_PREVIEW_LINE = ("Hey everyone, it's me. I have some news, and honestly, you are not going to believe it. "
@@ -502,15 +504,14 @@ class GuildVoiceSession():
                 source = discord.PCMVolumeTransformer(source, volume=volume)
             vc.play(source, after=_after)
 
-            try:
-                await asyncio.wait_for(done.wait(), timeout=PLAY_TIMEOUT)
-            except asyncio.TimeoutError:
-                # Playback wedged: force stop and rebuild the voice connection
+            reason = await self._wait_for_clip(vc, done)
+            if reason:
+                # Playback wedged: force stop and rebuild the voice connection (the next message reconnects)
                 try:
                     vc.stop()
                 except Exception:
                     pass
-                await self._recycle_voice_connection(reason="playback timeout")
+                await self._recycle_voice_connection(reason=reason)
         except discord.ClientException as e:
             # e.g. "Not connected." race
             print(f"[narrate] play race: {e}")
@@ -524,6 +525,32 @@ class GuildVoiceSession():
                 except Exception:
                     pass
                     
+    async def _wait_for_clip(self, vc, done: asyncio.Event) -> Optional[str]:
+        """Wait for the clip to finish. Returns why playback is stuck, or None when it ended normally.
+        If the voice connection drops mid-clip, discord.py pauses the player until it reconnects, which may be never;
+        don't let that hold up the whole queue for PLAY_TIMEOUT."""
+        start = time.monotonic()
+        down_since = None
+        while True:
+            try:
+                await asyncio.wait_for(done.wait(), timeout=PLAY_POLL_SECS)
+                return None
+            except asyncio.TimeoutError:
+                pass
+            now = time.monotonic()
+            try:
+                connected = vc.is_connected()
+            except Exception:
+                connected = False
+            if connected:
+                down_since = None
+            else:
+                down_since = down_since or now
+                if now - down_since >= VOICE_DOWN_GRACE_SECS:
+                    return f"voice connection down for {now - down_since:.0f}s mid-clip"
+            if now - start >= PLAY_TIMEOUT:
+                return "playback timeout"
+
     async def _recycle_voice_connection(self, reason: str):
         print(f"[narrate] recycling voice connection: {reason}")
         vc = self.voice_client

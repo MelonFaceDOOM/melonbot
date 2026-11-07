@@ -69,6 +69,47 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot_narrate.discord, "FFmpegPCMAudio", Mock()):
             await asyncio.wait_for(self.session._play_one(OGG), timeout=2)
 
+    async def test_voice_drop_mid_clip_rebuilds_connection_quickly(self):
+        # discord.py pauses the player while the voice connection is down, so `after` never fires
+        vc = Mock()
+        vc.is_connected.return_value = True
+        vc.play.side_effect = lambda source, after: setattr(vc.is_connected, "return_value", False)
+        vc.disconnect = AsyncMock()
+        self.session.voice_client = vc
+        with patch.object(bot_narrate.discord, "FFmpegPCMAudio", Mock()), \
+             patch.object(bot_narrate, "PLAY_POLL_SECS", 0.02), \
+             patch.object(bot_narrate, "VOICE_DOWN_GRACE_SECS", 0.1), \
+             patch.object(self.session, "_recycle_voice_connection", AsyncMock()) as recycle:
+            await asyncio.wait_for(self.session._play_one(OGG), timeout=2)  # not PLAY_TIMEOUT
+        recycle.assert_awaited_once()
+        self.assertIn("voice connection down", recycle.await_args.kwargs["reason"])
+
+    async def test_brief_voice_blip_does_not_cut_clip(self):
+        vc = Mock()
+        state = {"polls": 0}
+
+        def connected():
+            state["polls"] += 1
+            if state["polls"] == 4:
+                after_cb(None)  # clip ends normally once the connection is back
+            return state["polls"] not in (2, 3)  # down for two polls, shorter than the grace period
+
+        vc.is_connected.side_effect = connected
+        after_cb = None
+
+        def play(source, after):
+            nonlocal after_cb
+            after_cb = after
+
+        vc.play.side_effect = play
+        self.session.voice_client = vc
+        with patch.object(bot_narrate.discord, "FFmpegPCMAudio", Mock()), \
+             patch.object(bot_narrate, "PLAY_POLL_SECS", 0.02), \
+             patch.object(bot_narrate, "VOICE_DOWN_GRACE_SECS", 5), \
+             patch.object(self.session, "_recycle_voice_connection", AsyncMock()) as recycle:
+            await asyncio.wait_for(self.session._play_one(OGG), timeout=2)
+        recycle.assert_not_awaited()
+
 
 class CogTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
